@@ -61,7 +61,8 @@ type (
 )
 
 func init() {
-	db, err := otelsqlx.Open("sqlite3",
+	var err error
+	db, err = otelsqlx.Open("sqlite3",
 		"garden.sqlite3?cache=shared&_synchronous=normal&_journal_mode=WAL",
 		otelsql.WithAttributes(semconv.DBSystemSqlite))
 	if err != nil {
@@ -337,6 +338,7 @@ func DeleteSeedling(w http.ResponseWriter, r *http.Request) {
 func ListSeedlings(w http.ResponseWriter, r *http.Request) {
 	// Query the database for all seedlings
 	ss := []Seedling{}
+
 	if err := db.SelectContext(r.Context(), &ss, "SELECT * FROM seedlings"); err != nil {
 		logrus.WithField("error", err).Error("failed to get seedlings")
 		http.Error(w, "internal server error", http.StatusInternalServerError)
