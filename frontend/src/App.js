@@ -55,7 +55,7 @@ function TopBar() {
             <div>
                 <div className="flex flex-rows items-center">
                     <Link className="align-middle hover:underline" to="/">
-                    Garden
+                        Garden
                     </Link>
                 </div>
             </div>
@@ -112,8 +112,8 @@ function HomePage() {
         <>
             <TopBar />
             <div className="flex mt-2">
-            <SideBar />
-        Welcome to Garden
+                <SideBar />
+                Welcome to Garden
             </div>
         </>
     );
