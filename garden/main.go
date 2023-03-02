@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	mathrand "math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/c2h5oh/hide"
@@ -113,9 +116,11 @@ func serveCmd(cliCtx *cli.Context) error {
 	r.PathPrefix("/outputs/").
 		Handler(http.StripPrefix("/outputs/",
 			http.FileServer(http.Dir("./bucket/outputs"))))
-	r.Handle("/seedlings", WithLogging(
-		http.HandlerFunc(seedlingHandler),
-	))
+	r.Handle("/seedlings", WithLogging(http.HandlerFunc(ListSeedlings))).Methods("GET")
+	r.Handle("/seedlings", WithLogging(http.HandlerFunc(CreateSeedling))).Methods("POST")
+	r.Handle("/seedlings/{id}", WithLogging(http.HandlerFunc(GetSeedling))).Methods("GET")
+	r.Handle("/seedlings/{id}", WithLogging(http.HandlerFunc(DeleteSeedling))).Methods("DELETE")
+
 	log.WithField("service", "garden-api").Info("Listening on :7777")
 	http.ListenAndServe(":7777", otelhttp.NewHandler(r, "garden-api"))
 	return nil
@@ -189,5 +194,160 @@ func main() {
 
 	if err := app.Run(os.Args); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// CreateSeedling inserts a new seedling into the database and returns its id
+func CreateSeedling(w http.ResponseWriter, r *http.Request) {
+	// Parse and validate the request body as a seedling struct
+	var s Seedling
+	if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+		logrus.WithField("error", err).Error("failed to decode request body")
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if s.Name == "" {
+		logrus.Error("name is required")
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+
+	// Insert the seedling into the database
+	if _, err := db.NamedExecContext(r.Context(), "INSERT INTO seedlings (name, description, created_at, modified_at) VALUES (:name, :description, :created_at, :modified_at)", &s); err != nil {
+		logrus.WithField("error", err).Error("failed to insert seedling")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Return the created seedling as JSON
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(&s); err != nil {
+		logrus.WithField("error", err).Error("failed to encode response")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+}
+
+// GetSeedling retrieves a seedling by its id from the database and returns it as JSON
+func GetSeedling(w http.ResponseWriter, r *http.Request) {
+	// Get the id parameter from the URL
+	vars := mux.Vars(r)
+	id := vars["id"]
+	if id == "" {
+		logrus.Error("id is required")
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+
+	// Query the database for the seedling with the given id
+	var s Seedling
+	if err := db.GetContext(r.Context(), &s, "SELECT * FROM seedlings WHERE id = $1", id); err != nil {
+		if err == sql.ErrNoRows {
+			logrus.WithField("id", id).Error("seedling not found")
+			http.Error(w, "seedling not found", http.StatusNotFound)
+			return
+		}
+		logrus.WithField("error", err).Error("failed to get seedling")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Return the seedling as JSON
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(&s); err != nil {
+		logrus.WithField("error", err).Error("failed to encode response")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+}
+
+// UpdateSeedling updates a seedling by its id with the given fields and returns it as JSON
+func UpdateSeedling(w http.ResponseWriter, r *http.Request) {
+	// Get the id parameter from the URL
+	vars := mux.Vars(r)
+	id := vars["id"]
+	if id == "" {
+		logrus.Error("id is required")
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+
+	// Parse and validate the request body as a seedling struct
+	var s Seedling
+	if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+		logrus.WithField("error", err).Error("failed to decode request body")
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if s.Name == "" {
+		logrus.Error("name is required")
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+
+	// Set the id and modified_at fields of the seedling
+	sid, _ := strconv.Atoi(id)
+	s.ID = hide.Int64(sid)
+	s.ModifiedAt = time.Now()
+
+	// Update the seedling in the database with the given fields
+	if _, err := db.NamedExecContext(r.Context(), "UPDATE seedlings SET name = :name, description = :description, modified_at = :modified_at WHERE id = :id", &s); err != nil {
+		logrus.WithField("error", err).Error("failed to update seedling")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Return the updated seedling as JSON
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(&s); err != nil {
+		logrus.WithField("error", err).Error("failed to encode response")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+}
+
+// DeleteSeedling deletes a seedling by its id from the database and returns a success message
+func DeleteSeedling(w http.ResponseWriter, r *http.Request) {
+	// Get the id parameter from the URL
+	vars := mux.Vars(r)
+	id := vars["id"]
+	if id == "" {
+		logrus.Error("id is required")
+		http.Error(w, "id is required", http.StatusBadRequest)
+		return
+	}
+
+	// Delete the seedling from the database with the given id
+	if _, err := db.ExecContext(r.Context(), "DELETE FROM seedlings WHERE id = $1", id); err != nil {
+		logrus.WithField("error", err).Error("failed to delete seedling")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Return a success message
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]string{"message": "seedling deleted"}); err != nil {
+		logrus.WithField("error", err).Error("failed to encode response")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+}
+
+// ListSeedlings retrieves all seedlings from the database and returns them as JSON
+func ListSeedlings(w http.ResponseWriter, r *http.Request) {
+	// Query the database for all seedlings
+	ss := []Seedling{}
+	if err := db.SelectContext(r.Context(), &ss, "SELECT * FROM seedlings"); err != nil {
+		logrus.WithField("error", err).Error("failed to get seedlings")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Return the seedlings as JSON
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(&ss); err != nil {
+		logrus.WithField("error", err).Error("failed to encode response")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
 	}
 }
