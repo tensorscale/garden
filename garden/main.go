@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	MAX_SQLITE_CONNS             = 1
+	MAX_SQLITE_CONNS = 1
 )
 
 var (
