@@ -117,10 +117,11 @@ func serveCmd(cliCtx *cli.Context) error {
 	r.PathPrefix("/outputs/").
 		Handler(http.StripPrefix("/outputs/",
 			http.FileServer(http.Dir("./bucket/outputs"))))
-	r.Handle("/seedlings", WithLogging(http.HandlerFunc(ListSeedlings))).Methods("GET")
-	r.Handle("/seedlings", WithLogging(http.HandlerFunc(CreateSeedling))).Methods("POST")
-	r.Handle("/seedlings/{id}", WithLogging(http.HandlerFunc(GetSeedling))).Methods("GET")
-	r.Handle("/seedlings/{id}", WithLogging(http.HandlerFunc(DeleteSeedling))).Methods("DELETE")
+	r.Handle("/api/v1/seedlings", WithLogging(http.HandlerFunc(ListSeedlings))).Methods("GET")
+	r.Handle("/api/v1/seedlings", WithLogging(http.HandlerFunc(CreateSeedling))).Methods("POST")
+	r.Handle("/api/v1/seedlings/{id}", WithLogging(http.HandlerFunc(GetSeedling))).Methods("GET")
+	r.Handle("/api/v1/seedlings/{id}", WithLogging(http.HandlerFunc(DeleteSeedling))).Methods("DELETE")
+	r.Handle("/api/v1/seedlings/{id}", WithLogging(http.HandlerFunc(UpdateSeedling))).Methods("PUT")
 
 	log.WithField("service", "garden-api").Info("Listening on :7777")
 	http.ListenAndServe(":7777", otelhttp.NewHandler(r, "garden-api"))
