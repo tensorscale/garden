@@ -113,7 +113,6 @@ function HomePage() {
             <TopBar />
             <div className="flex mt-2">
                 <SideBar />
-                Welcome to Seedline Manager
                 <SeedlingManager />
             </div>
             
@@ -269,7 +268,7 @@ const useFetch = (url, options) => {
     const [error, setError] = useState(null);
   
     // The base URL for the CRUD API
-    const baseURL = "http://localhost:7777/seedlings";
+    const baseURL = "http://localhost:3001/api/v1/seedlings";
   
     // A helper function to refresh the seedlings list
     const refreshSeedlings = () => {
