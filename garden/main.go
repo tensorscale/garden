@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"go/format"
 	"io/ioutil"
 	mathrand "math/rand"
 	"net/http"
@@ -30,6 +31,8 @@ import (
 	"github.com/urfave/cli"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+
+	gogpt "github.com/sashabaranov/go-gpt3"
 )
 
 const (
@@ -164,6 +167,16 @@ func serveCmd(cliCtx *cli.Context) error {
 }
 
 func main() {
+	// for testing purposes, use a simple task
+	seedlingDesc := "Write a Hello World program in Go."
+	expectedOutput := "Hello, World!\n"
+
+	// call the gpt_thread function
+	result := gpt_thread(seedlingDesc, expectedOutput)
+
+	// print the result
+	fmt.Println(result)
+
 	mathrand.Seed(time.Now().UnixNano())
 	logrus.SetReportCaller(true)
 	logrus.SetFormatter(&logrus.TextFormatter{
@@ -509,4 +522,95 @@ func ListSeedlings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
+}
+
+func gpt_thread(seedlingDesc string, expectedOutput string) string {
+	c := gogpt.NewClient(os.Getenv("OPENAI_API_KEY"))
+	ctx := context.Background()
+
+	maxRuns := 5
+
+	// our instructions for service are written here
+	thread := seedlingDesc
+	threadStartSeq := "```go"
+
+	thread += " Use markdown.\n\n" + threadStartSeq
+
+	// loop until runs is 0
+	for i := 0; i < maxRuns; i++ {
+
+		gptOutput := gpt(c, ctx, thread)
+
+		exec := runAndClassify(gptOutput)
+
+		if exec["error"] != "" {
+			thread += "\n\nI got this error: " + exec["error"]
+
+			thread += "\n\nHere is the fix for the error. Use Markdown."
+			thread += threadStartSeq
+		} else {
+			thread += "\n\nI got this output: " + exec["output"]
+			isFinishedPrompt := "I ran this code:\n\n" + gptOutput + "\n\nAnd got this output:\n\n" + exec["output"] + "\n\nMy expected output was this:\n\n" + expectedOutput + "Return the word yes or no to indicate if I got the correct output.\n\nAnswer:"
+			isFinished := gpt(c, ctx, isFinishedPrompt)
+			if isFinished == "yes" {
+				return gptOutput
+			} else {
+				thread += isFinishedPrompt + "\n\nI got the wrong output. Provide a fix to get the expected output. Use Markdown.\n\n" + threadStartSeq
+			}
+		}
+	}
+	return ""
+}
+
+func gpt(c *gogpt.Client, ctx context.Context, prompt string) string {
+	req := gogpt.CompletionRequest{
+		Model:     "text-davinci-003",
+		MaxTokens: 1000,
+		Prompt:    prompt,
+		Stop:      []string{"```"},
+	}
+	resp, err := c.CreateCompletion(ctx, req)
+	if err != nil {
+		return ""
+	}
+	fmt.Println(resp.Choices[0].Text)
+	return resp.Choices[0].Text
+}
+
+func runAndClassify(code string) map[string]string {
+	// remove the markdown syntax
+	code = strings.TrimPrefix(code, "```go")
+	code = strings.TrimSuffix(code, "```")
+
+	// format the code
+	formatted, err := format.Source([]byte(code))
+	if err != nil {
+		return map[string]string{"error": err.Error(), "output": ""}
+	}
+	code = string(formatted) // convert the formatted bytes to string
+
+	// create a temporary file
+	tmpfile, err := os.CreateTemp("", "gpt-*.go")
+	if err != nil {
+		return map[string]string{"error": err.Error(), "output": ""}
+	}
+	defer os.Remove(tmpfile.Name()) // clean up
+
+	// write the code to the file
+	if _, err := tmpfile.Write([]byte(code)); err != nil {
+		return map[string]string{"error": err.Error(), "output": ""}
+	}
+	if err := tmpfile.Close(); err != nil {
+		return map[string]string{"error": err.Error(), "output": ""}
+	}
+
+	// run the file with go run
+	cmd := exec.Command("go", "run", tmpfile.Name())
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return map[string]string{"error": stderr.String(), "output": ""}
+	}
+	return map[string]string{"error": "", "output": stdout.String()}
 }
