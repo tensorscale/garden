@@ -68,6 +68,33 @@ type (
 	}
 )
 
+var (
+	protoPrompt = `
+Write me a protobufs file for a method that will %s.
+
+Include the protoc command for this. Something along the lines of:
+
+protoc -I=. --go_out=./protobufs --go-grpc_out=./protobufs protobufs/%s.proto
+
+Make sure to include a line like:
+
+option go_package = "./protobufs";
+
+The file will be called %s.proto. Do not override any of my file names.
+
+My directory layout is:
+
+$ ls .
+Dockerfile          client              docker-compose.yaml go.mod              protobufs           server
+
+My go.mod is:
+
+module %s
+
+go 1.19
+`
+)
+
 func init() {
 	var err error
 	db, err = otelsqlx.Open("sqlite3",
@@ -249,7 +276,7 @@ func main() {
 
 func cleanFilePath(filePath string) string {
 	invalidCharsRegex := regexp.MustCompile(`[^\w-.]`)
-	cleanedPath := strings.ReplaceAll(filePath, " ", "-")
+	cleanedPath := strings.ReplaceAll(filePath, " ", "_")
 	cleanedPath = invalidCharsRegex.ReplaceAllString(cleanedPath, "")
 	return strings.ToLower(cleanedPath)
 }
@@ -336,6 +363,16 @@ networks:
 		logrus.WithField("error", err).Error("failed to init git repo")
 		return err
 	}
+
+	prompt := fmt.Sprintf(
+		protoPrompt,
+		seedling.Description,
+		seedling.Name,
+		seedling.Name,
+		seedling.Name,
+	)
+
+	fmt.Println(prompt)
 
 	return nil
 }
@@ -509,7 +546,8 @@ func ListSeedlings(w http.ResponseWriter, r *http.Request) {
 	// Query the database for all seedlings
 	ss := []Seedling{}
 
-	if err := db.SelectContext(r.Context(), &ss, "SELECT * FROM seedlings"); err != nil {
+	if err := db.SelectContext(r.Context(), &ss,
+		"SELECT * FROM seedlings ORDER BY created_at DESC"); err != nil {
 		logrus.WithField("error", err).Error("failed to get seedlings")
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
