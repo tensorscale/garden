@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	mathrand "math/rand"
 	"net/http"
 	"os"
@@ -107,11 +109,6 @@ func writeJSONErr(w http.ResponseWriter, err string, code int) {
 	w.Write([]byte(fmt.Sprintf(`{"error":"%s"}`, err)))
 }
 
-func seedlingHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf(`{"seedlings":[]}`)))
-}
-
 func serveCmd(cliCtx *cli.Context) error {
 	r := mux.NewRouter()
 	r.PathPrefix("/outputs/").
@@ -199,9 +196,61 @@ func main() {
 	}
 }
 
-// CreateSeedling inserts a new seedling into the database and returns its id
+func writeSeedlingToRepo(ctx context.Context, seedlingName string) error {
+	// create following subdirectories in "repos/%s/default" dir:
+	// 1. protobufs
+	// 2. server
+	// 3. client
+	if err := os.MkdirAll(fmt.Sprintf("repos/%s/default/protobufs", seedlingName), 0755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(fmt.Sprintf("repos/%s/default/server", seedlingName), 0755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(fmt.Sprintf("repos/%s/default/client", seedlingName), 0755); err != nil {
+		return err
+	}
+
+	defaultModContents := fmt.Sprintf(`module %s
+
+go 1.19`, seedlingName)
+	if err := ioutil.WriteFile(fmt.Sprintf("repos/%s/default/go.mod", seedlingName), []byte(defaultModContents), 0644); err != nil {
+		logrus.WithField("error", err).Error("failed to write to go.mod")
+	}
+
+	protoContents := `syntax = "proto3";
+
+option go_package = ".";`
+	if err := ioutil.WriteFile(fmt.Sprintf("repos/%s/default/protobufs/%s.proto", seedlingName, seedlingName), []byte(protoContents), 0644); err != nil {
+		logrus.WithField("error", err).Error("failed to write to protobufs")
+	}
+
+	serverContents := `package main
+
+func main() {
+	fmt.Println("Welcome to seedling")
+}`
+	if err := ioutil.WriteFile(fmt.Sprintf("repos/%s/default/server/main.go", seedlingName), []byte(serverContents), 0644); err != nil {
+		logrus.WithField("error", err).Error("failed to write to server")
+	}
+
+	clientContents := `package main
+
+func main() {
+	fmt.Println("Welcome to seedling")
+}`
+	if err := ioutil.WriteFile(fmt.Sprintf("repos/%s/default/client/main.go", seedlingName), []byte(clientContents), 0644); err != nil {
+		logrus.WithField("error", err).Error("failed to write to client")
+	}
+
+	return nil
+}
+
+func growSeedSession(ctx context.Context) {
+
+}
+
 func CreateSeedling(w http.ResponseWriter, r *http.Request) {
-	// Parse and validate the request body as a seedling struct
 	var s Seedling
 	if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
 		logrus.WithField("error", err).Error("failed to decode request body")
@@ -214,14 +263,18 @@ func CreateSeedling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Insert the seedling into the database
 	if _, err := db.NamedExecContext(r.Context(), "INSERT INTO seedlings (name, description, created_at, modified_at) VALUES (:name, :description, :created_at, :modified_at)", &s); err != nil {
 		logrus.WithField("error", err).Error("failed to insert seedling")
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	// Return the created seedling as JSON
+	if err := writeSeedlingToRepo(r.Context(), s.Name); err != nil {
+		logrus.WithField("error", err).Error("failed to write seedling to repo")
+		writeJSONErr(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(&s); err != nil {
 		logrus.WithField("error", err).Error("failed to encode response")
@@ -230,9 +283,7 @@ func CreateSeedling(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// GetSeedling retrieves a seedling by its id from the database and returns it as JSON
 func GetSeedling(w http.ResponseWriter, r *http.Request) {
-	// Get the id parameter from the URL
 	vars := mux.Vars(r)
 	id := vars["id"]
 	if id == "" {
@@ -241,7 +292,6 @@ func GetSeedling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Query the database for the seedling with the given id
 	var s Seedling
 	if err := db.GetContext(r.Context(), &s, "SELECT * FROM seedlings WHERE id = $1", id); err != nil {
 		if err == sql.ErrNoRows {
@@ -319,8 +369,18 @@ func DeleteSeedling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Delete the seedling from the database with the given id
-	if _, err := db.ExecContext(r.Context(), "DELETE FROM seedlings WHERE id = $1", id); err != nil {
+	numID, err := strconv.Atoi(id)
+	if err != nil {
+		logrus.WithField("error", err).Error("failed to convert id to int")
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+
+	if _, err := db.ExecContext(
+		r.Context(),
+		"DELETE FROM seedlings WHERE id = $1",
+		hide.Default.Int64Deobfuscate(int64(numID)),
+	); err != nil {
 		logrus.WithField("error", err).Error("failed to delete seedling")
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
