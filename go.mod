@@ -29,6 +29,7 @@ require (
 	github.com/lufia/plan9stats v0.0.0-20220913051719-115f729f3c8c // indirect
 	github.com/power-devops/perfstat v0.0.0-20220216144756-c35f1ee13d7c // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
+	github.com/sashabaranov/go-gpt3 v1.3.1 // indirect
 	github.com/sethvargo/go-envconfig v0.8.2 // indirect
 	github.com/shirou/gopsutil/v3 v3.23.1 // indirect
 	github.com/tklauser/go-sysconf v0.3.11 // indirect
