@@ -10,9 +10,12 @@ import (
 	mathrand "math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/c2h5oh/hide"
@@ -78,6 +81,39 @@ func init() {
 	if _, err := db.Exec("PRAGMA mmap_size = 30000000000;"); err != nil {
 		logrus.Fatal(err)
 	}
+
+	if _, err := os.Stat("./repos/default"); os.IsNotExist(err) {
+		if err := os.MkdirAll("./repos/default", 0755); err != nil {
+			logrus.Fatal(err)
+		}
+		if err := os.Chdir("./repos/default"); err != nil {
+			logrus.Fatal(err)
+		}
+
+		cmd := exec.Command("git", "init")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			logrus.Fatal(err)
+		}
+
+		if err := os.Chdir("../.."); err != nil {
+			logrus.Fatal(err)
+		}
+	}
+
+	cmd := exec.Command("docker", "ps")
+	if err := cmd.Run(); err != nil {
+		logrus.WithField("error", err).Fatal("Docker must be running")
+	}
+
+	cmd = exec.Command("docker", "network", "inspect", "seedlings")
+	if err := cmd.Run(); err != nil {
+		cmd = exec.Command("docker", "network", "create", "seedlings")
+		if err := cmd.Run(); err != nil {
+			logrus.WithField("error", err).Fatal("Failed to create docker network")
+		}
+	}
 }
 
 func WithLogging(next http.Handler) http.Handler {
@@ -121,7 +157,9 @@ func serveCmd(cliCtx *cli.Context) error {
 	r.Handle("/api/v1/seedlings/{id}", WithLogging(http.HandlerFunc(UpdateSeedling))).Methods("PUT")
 
 	log.WithField("service", "garden-api").Info("Listening on :7777")
-	http.ListenAndServe(":7777", otelhttp.NewHandler(r, "garden-api"))
+	if err := http.ListenAndServe(":7777", otelhttp.NewHandler(r, "garden-api")); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -196,32 +234,37 @@ func main() {
 	}
 }
 
-func writeSeedlingToRepo(ctx context.Context, seedlingName string) error {
-	// create following subdirectories in "repos/%s/default" dir:
-	// 1. protobufs
-	// 2. server
-	// 3. client
-	if err := os.MkdirAll(fmt.Sprintf("repos/%s/default/protobufs", seedlingName), 0755); err != nil {
+func cleanFilePath(filePath string) string {
+	invalidCharsRegex := regexp.MustCompile(`[^\w-.]`)
+	cleanedPath := strings.ReplaceAll(filePath, " ", "-")
+	cleanedPath = invalidCharsRegex.ReplaceAllString(cleanedPath, "")
+	return strings.ToLower(cleanedPath)
+}
+
+func initGoRepo(ctx context.Context, seedling Seedling) error {
+	dirpath := cleanFilePath(seedling.Name)
+	basePath := filepath.Join("repos", "default", dirpath)
+	if err := os.MkdirAll(filepath.Join(basePath, "protobufs"), 0755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(fmt.Sprintf("repos/%s/default/server", seedlingName), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(basePath, "server"), 0755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(fmt.Sprintf("repos/%s/default/client", seedlingName), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(basePath, "client"), 0755); err != nil {
 		return err
 	}
 
 	defaultModContents := fmt.Sprintf(`module %s
 
-go 1.19`, seedlingName)
-	if err := ioutil.WriteFile(fmt.Sprintf("repos/%s/default/go.mod", seedlingName), []byte(defaultModContents), 0644); err != nil {
+go 1.19`, dirpath)
+	if err := ioutil.WriteFile(filepath.Join(basePath, "go.mod"), []byte(defaultModContents), 0644); err != nil {
 		logrus.WithField("error", err).Error("failed to write to go.mod")
 	}
 
 	protoContents := `syntax = "proto3";
 
 option go_package = ".";`
-	if err := ioutil.WriteFile(fmt.Sprintf("repos/%s/default/protobufs/%s.proto", seedlingName, seedlingName), []byte(protoContents), 0644); err != nil {
+	if err := ioutil.WriteFile(filepath.Join(basePath, "protobufs", fmt.Sprintf("%s.proto", dirpath)), []byte(protoContents), 0644); err != nil {
 		logrus.WithField("error", err).Error("failed to write to protobufs")
 	}
 
@@ -230,7 +273,7 @@ option go_package = ".";`
 func main() {
 	fmt.Println("Welcome to seedling")
 }`
-	if err := ioutil.WriteFile(fmt.Sprintf("repos/%s/default/server/main.go", seedlingName), []byte(serverContents), 0644); err != nil {
+	if err := ioutil.WriteFile(filepath.Join(basePath, "server", "main.go"), []byte(serverContents), 0644); err != nil {
 		logrus.WithField("error", err).Error("failed to write to server")
 	}
 
@@ -239,8 +282,55 @@ func main() {
 func main() {
 	fmt.Println("Welcome to seedling")
 }`
-	if err := ioutil.WriteFile(fmt.Sprintf("repos/%s/default/client/main.go", seedlingName), []byte(clientContents), 0644); err != nil {
+	if err := ioutil.WriteFile(filepath.Join(basePath, "client", "main.go"), []byte(clientContents), 0644); err != nil {
 		logrus.WithField("error", err).Error("failed to write to client")
+	}
+
+	dockerfileContents := `FROM debian:slim
+COPY . /app
+`
+	if err := ioutil.WriteFile(filepath.Join(basePath, "Dockerfile"), []byte(dockerfileContents), 0644); err != nil {
+		logrus.WithField("error", err).Error("failed to write to client")
+	}
+
+	composeContents := fmt.Sprintf(`version: "3.9"
+services:
+  %s:
+    image: %s
+    networks:
+    - seedlings
+	volumes:
+    - ../secrets:/secrets
+
+networks:
+  seedlings:
+    external: true
+`, dirpath, dirpath)
+	if err := ioutil.WriteFile(filepath.Join(basePath, "docker-compose.yaml"), []byte(composeContents), 0644); err != nil {
+		logrus.WithField("error", err).Error("failed to write to client")
+	}
+
+	cmd := exec.CommandContext(ctx, "git", "add", ".")
+	cmd.Dir = filepath.Join(basePath)
+	if err := cmd.Run(); err != nil {
+		logrus.WithField("error", err).Error("failed to init git repo")
+		return err
+	}
+
+	cmd = exec.CommandContext(ctx, "git", "commit", "-m", ".")
+	cmd.Dir = filepath.Join(basePath)
+	if err := cmd.Run(); err != nil {
+		logrus.WithField("error", err).Error("failed to init git repo")
+		return err
+	}
+
+	return nil
+}
+
+func writeSeedlingToRepo(ctx context.Context, seedling Seedling) error {
+	// TODO: more languages etc
+	if err := initGoRepo(ctx, seedling); err != nil {
+		return err
 	}
 
 	return nil
@@ -263,13 +353,19 @@ func CreateSeedling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := db.NamedExecContext(r.Context(), "INSERT INTO seedlings (name, description, created_at, modified_at) VALUES (:name, :description, :created_at, :modified_at)", &s); err != nil {
+	s.Name = cleanFilePath(s.Name)
+
+	if _, err := db.NamedExecContext(r.Context(), `
+	 INSERT INTO seedlings
+	 (name, description, created_at, modified_at)
+	 VALUES (:name, :description, :created_at, :modified_at)
+	 `, &s); err != nil {
 		logrus.WithField("error", err).Error("failed to insert seedling")
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	if err := writeSeedlingToRepo(r.Context(), s.Name); err != nil {
+	if err := writeSeedlingToRepo(r.Context(), s); err != nil {
 		logrus.WithField("error", err).Error("failed to write seedling to repo")
 		writeJSONErr(w, "internal server error", http.StatusInternalServerError)
 		return

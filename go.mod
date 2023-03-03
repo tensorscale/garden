@@ -13,6 +13,7 @@ require (
 	github.com/uptrace/opentelemetry-go-extra/otelsql v0.1.21
 	github.com/uptrace/opentelemetry-go-extra/otelsqlx v0.1.21
 	github.com/urfave/cli v1.22.12
+	github.com/yuin/goldmark v1.1.32
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.40.0
 	go.opentelemetry.io/otel v1.14.0
 )
