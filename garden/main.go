@@ -668,7 +668,8 @@ Use debian:bookworm-slim as the base image for both stages.
 
 Make sure to install any external libraries, packages, and binaries you need.
 
-Calculate the go.sum, don't COPY it.
+Calculate the go.sum, don't COPY it. Make sure to do go get all required
+modules.
 
 Think step by step -- what's the best way to build the file?
 
