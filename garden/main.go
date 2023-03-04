@@ -329,7 +329,7 @@ func main() {
 		logrus.WithField("error", err).Error("failed to write to client")
 	}
 
-	dockerfileContents := `FROM debian:slim
+	dockerfileContents := `FROM debian:bookworm-slim
 COPY . /app
 `
 	if err := ioutil.WriteFile(filepath.Join(basePath, "Dockerfile"), []byte(dockerfileContents), 0644); err != nil {
@@ -611,12 +611,12 @@ func gptThread(seedling Seedling) {
 	}
 
 	errs := 0
+	prompt := ""
 	for {
 		if steps[step] == SeedlingStepComplete {
 			break
 		}
 
-		prompt := ""
 		repoPath := ""
 		codeType := ""
 		cmdCmd := ""
@@ -641,6 +641,44 @@ Use markdown and include only the file requested.
 				"--go-grpc_out=.",
 				repoPath,
 			}
+		case SeedlingStepServer:
+			prompt = fmt.Sprintf(`%s
+Now write a server implementation for the service method(s).
+
+1. Feel free to use external libraries, packages, and binaries. We will install
+them for you.
+2. Assume you are running in a Docker container (Linux).
+3. Have the service listen on port 80, with insecure connection settings.
+
+Think step by step -- what's the best way to solve the problem?
+
+Use markdown and include only the file requested.
+`+"```go", prompt)
+			repoPath = filepath.Join("server", "main.go")
+			codeType = "go"
+			cmdCmd = "true"
+			cmdArgs = []string{}
+		case SeedlingStepDockerfile:
+			prompt = fmt.Sprintf(`%s
+Now write a Dockerfile (multi-stage build) to build and run your server.
+
+Use debian:bookworm-slim as the base image for both stages.
+
+Make sure to install any external libraries, packages, and binaries you need.
+
+Think step by step -- what's the best way to build the file?
+
+Use markdown and include only the file requested.
+`+"```dockerfile", prompt)
+			repoPath = filepath.Join("Dockerfile")
+			codeType = ""
+			cmdCmd = "docker"
+			cmdArgs = []string{
+				"build",
+				"-t",
+				seedling.Name,
+				".",
+			}
 		default:
 			logrus.WithField("step", steps[step]).Error("unknown step")
 			return
@@ -660,16 +698,16 @@ Use markdown and include only the file requested.
 				"default",
 				seedling.Name,
 			)
-			fmt.Println("PROMPT:")
-			fmt.Println(prompt)
-			fmt.Println()
+
 			gptOutput, err := gpt(ctx, c, prompt)
 			if err != nil {
 				logrus.WithField("error", err).Error("failed to get gpt output")
 				return
 			}
 
-			prompt += "You replied: \n\n" + gptOutput + "\n\n"
+			fmt.Println(gptOutput)
+
+			prompt += "\n\n" + gptOutput + "\n\n"
 
 			if output, err := runSeedling(
 				file,
@@ -677,16 +715,24 @@ Use markdown and include only the file requested.
 				buildCmd,
 				gptOutput,
 			); err != nil {
+				spew.Dump(buildCmd)
+				fmt.Println(output)
 				if output == "" {
 					logrus.WithField("error", err).Error("something went wrong on seedling run that wasn't build, exiting")
 					return
 				}
-				logrus.WithField("error", err).Fatal("Failed to run seedling")
 				errs++
 				if errs > maxErrs {
-					logrus.Info("Max errors exceeded")
+					logrus.Error("Max errors exceeded")
 					return
 				}
+
+				lines := strings.Split(output, "\n")
+				if len(lines) > 10 {
+					lines = lines[len(lines)-10:]
+				}
+				output = strings.Join(lines, "\n")
+
 				prompt += "\n\nBut it was wrong. I got an error: " + output
 				prompt += "\n\nFix the error by writing a version that works. Use Markdown."
 				prompt += "\n\n" + "```" + codeType
@@ -695,7 +741,6 @@ Use markdown and include only the file requested.
 					logrus.Info("Seedling run complete.")
 					return
 				}
-				spew.Dump(seedling)
 				if _, err := db.ExecContext(
 					ctx,
 					"UPDATE seedlings SET step = $1 WHERE id = $2",
@@ -729,7 +774,7 @@ Use markdown and include only the file requested.
 func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
 	req := gogpt.CompletionRequest{
 		Model:     "text-davinci-003",
-		MaxTokens: 1000,
+		MaxTokens: 2048,
 		Prompt:    prompt,
 		Stop:      []string{"```"},
 	}
@@ -737,8 +782,9 @@ func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	fmt.Println()
-	logrus.Info("GPT RESPONSE:")
+	logrus.WithField("finishReason", resp.Choices[0].FinishReason).Info("GOT GPT RESPONSE")
 	fmt.Println(resp.Choices[0].Text)
 	fmt.Println()
 	return resp.Choices[0].Text, nil
@@ -752,6 +798,7 @@ func runSeedling(
 ) (string, error) {
 	gptOut = strings.TrimPrefix(gptOut, "```"+codeType)
 	gptOut = strings.TrimSuffix(gptOut, "```")
+	gptOut = strings.TrimSpace(gptOut)
 
 	if err := ioutil.WriteFile(file, []byte(gptOut), 0644); err != nil {
 		return "", err
