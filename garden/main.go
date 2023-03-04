@@ -95,6 +95,8 @@ My go.mod is:
 module %s
 
 go 1.19
+
+For what it's worth. I hate comments. Let's avoid writing comments.
 `
 )
 
@@ -666,15 +668,20 @@ Use debian:bookworm-slim as the base image for both stages.
 
 Make sure to install any external libraries, packages, and binaries you need.
 
+Calculate the go.sum, don't COPY it.
+
 Think step by step -- what's the best way to build the file?
 
 Use markdown and include only the file requested.
 `+"```dockerfile", prompt)
 			repoPath = filepath.Join("Dockerfile")
-			codeType = ""
+			codeType = "dockerfile"
 			cmdCmd = "docker"
 			cmdArgs = []string{
+				"buildx",
 				"build",
+				"--platform",
+				"linux/amd64",
 				"-t",
 				seedling.Name,
 				".",
@@ -734,7 +741,7 @@ Use markdown and include only the file requested.
 				output = strings.Join(lines, "\n")
 
 				prompt += "\n\nBut it was wrong. I got an error: " + output
-				prompt += "\n\nFix the error by writing a version that works. Use Markdown."
+				prompt += "\n\nChange the file to fix it. We'll write the whole file again. Only code. No comments."
 				prompt += "\n\n" + "```" + codeType
 			} else {
 				if step+1 == len(steps) {
@@ -750,7 +757,7 @@ Use markdown and include only the file requested.
 					logrus.WithField("error", err).Error("failed to update seedling step")
 					return
 				}
-				prompt += "\n\nYou did that step correctly. Let's move on to the next step.\n\n"
+				prompt += "\n\nGreat. That worked. Let's move on to the next step.\n\n"
 				step += 1
 				break
 			}
@@ -772,8 +779,12 @@ Use markdown and include only the file requested.
 }
 
 func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
+	fmt.Println("====== PROMPTING GPT ======")
+	fmt.Println(prompt)
+	fmt.Println("===========================")
+
 	req := gogpt.CompletionRequest{
-		Model:     "text-davinci-003",
+		Model:     "text-alpha-002-latest",
 		MaxTokens: 2048,
 		Prompt:    prompt,
 		Stop:      []string{"```"},
@@ -785,8 +796,9 @@ func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
 
 	fmt.Println()
 	logrus.WithField("finishReason", resp.Choices[0].FinishReason).Info("GOT GPT RESPONSE")
+	fmt.Println("========= GPT OUT =========")
 	fmt.Println(resp.Choices[0].Text)
-	fmt.Println()
+	fmt.Println("===========================")
 	return resp.Choices[0].Text, nil
 }
 
