@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"go/format"
 	"io/ioutil"
 	mathrand "math/rand"
 	"net/http"
@@ -20,19 +19,19 @@ import (
 	"time"
 
 	"github.com/c2h5oh/hide"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/gorilla/mux"
 	_ "github.com/honeycombio/honeycomb-opentelemetry-go"
 	"github.com/honeycombio/otel-launcher-go/launcher"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
+	gogpt "github.com/sashabaranov/go-gpt3"
 	"github.com/sirupsen/logrus"
 	"github.com/uptrace/opentelemetry-go-extra/otelsql"
 	"github.com/uptrace/opentelemetry-go-extra/otelsqlx"
 	"github.com/urfave/cli"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
-
-	gogpt "github.com/sashabaranov/go-gpt3"
 )
 
 const (
@@ -40,8 +39,14 @@ const (
 )
 
 var (
-	log *logrus.Entry
-	db  *sqlx.DB
+	log                       *logrus.Entry
+	db                        *sqlx.DB
+	SeedlingStepProtobufs     = "SeedlingStepProtobufs"
+	SeedlingStepServer        = "SeedlingStepServer"
+	SeedlingStepDockerfile    = "SeedlingStepDockerfile"
+	SeedlingStepDockerCompose = "SeedlingStepDockerCompose"
+	SeedlingStepClient        = "SeedlingStepClient"
+	SeedlingStepComplete      = "SeedlingStepComplete"
 )
 
 type DBRow struct {
@@ -54,6 +59,7 @@ type Seedling struct {
 	DBRow
 	Name        string `db:"name" json:"name"`
 	Description string `db:"description" json:"description"`
+	Step        string `db:"step" json:"step"`
 }
 
 type (
@@ -70,14 +76,11 @@ type (
 
 var (
 	protoPrompt = `
-Write me a protobufs file for a method that will %s.
+Write me a protobufs file for a method that %s
 
-Include the protoc command for this. Something along the lines of:
+Make sure to start it with lines like:
 
-protoc -I=. --go_out=./protobufs --go-grpc_out=./protobufs protobufs/%s.proto
-
-Make sure to include a line like:
-
+syntax = "proto3";
 option go_package = "./protobufs";
 
 The file will be called %s.proto. Do not override any of my file names.
@@ -144,6 +147,16 @@ func init() {
 			logrus.WithField("error", err).Fatal("Failed to create docker network")
 		}
 	}
+
+	seedlings := []Seedling{}
+	if err := db.Select(&seedlings, "SELECT * FROM seedlings"); err != nil {
+		logrus.Fatal(err)
+	}
+	for _, seedling := range seedlings {
+		if seedling.Step != SeedlingStepComplete {
+			go gptThread(seedling)
+		}
+	}
 }
 
 func WithLogging(next http.Handler) http.Handler {
@@ -194,16 +207,6 @@ func serveCmd(cliCtx *cli.Context) error {
 }
 
 func main() {
-	// for testing purposes, use a simple task
-	seedlingDesc := "Write a Hello World program in Go."
-	expectedOutput := "Hello, World!\n"
-
-	// call the gpt_thread function
-	result := gpt_thread(seedlingDesc, expectedOutput)
-
-	// print the result
-	fmt.Println(result)
-
 	mathrand.Seed(time.Now().UnixNano())
 	logrus.SetReportCaller(true)
 	logrus.SetFormatter(&logrus.TextFormatter{
@@ -274,9 +277,9 @@ func main() {
 	}
 }
 
-func cleanFilePath(filePath string) string {
+func cleanFilePath(file string) string {
 	invalidCharsRegex := regexp.MustCompile(`[^\w-.]`)
-	cleanedPath := strings.ReplaceAll(filePath, " ", "_")
+	cleanedPath := strings.ReplaceAll(file, " ", "_")
 	cleanedPath = invalidCharsRegex.ReplaceAllString(cleanedPath, "")
 	return strings.ToLower(cleanedPath)
 }
@@ -364,15 +367,7 @@ networks:
 		return err
 	}
 
-	prompt := fmt.Sprintf(
-		protoPrompt,
-		seedling.Description,
-		seedling.Name,
-		seedling.Name,
-		seedling.Name,
-	)
-
-	fmt.Println(prompt)
+	go gptThread(seedling)
 
 	return nil
 }
@@ -384,10 +379,6 @@ func writeSeedlingToRepo(ctx context.Context, seedling Seedling) error {
 	}
 
 	return nil
-}
-
-func growSeedSession(ctx context.Context) {
-
 }
 
 func CreateSeedling(w http.ResponseWriter, r *http.Request) {
@@ -404,16 +395,27 @@ func CreateSeedling(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.Name = cleanFilePath(s.Name)
+	s.Step = SeedlingStepProtobufs
 
-	if _, err := db.NamedExecContext(r.Context(), `
+	result, err := db.NamedExecContext(r.Context(), `
 	 INSERT INTO seedlings
-	 (name, description, created_at, modified_at)
-	 VALUES (:name, :description, :created_at, :modified_at)
-	 `, &s); err != nil {
+	 (name, description, created_at, modified_at, step)
+	 VALUES (:name, :description, :created_at, :modified_at, :step)
+	 `, &s)
+	if err != nil {
 		logrus.WithField("error", err).Error("failed to insert seedling")
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
+
+	// get last inserted row id and set s.ID
+	id, err := result.LastInsertId()
+	if err != nil {
+		logrus.WithField("error", err).Error("failed to get last inserted id")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	s.ID = hide.Int64(id)
 
 	if err := writeSeedlingToRepo(r.Context(), s); err != nil {
 		logrus.WithField("error", err).Error("failed to write seedling to repo")
@@ -522,11 +524,45 @@ func DeleteSeedling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var seedling Seedling
+	if err := db.GetContext(r.Context(),
+		&seedling,
+		"SELECT * FROM seedlings WHERE id = $1",
+		hide.Default.Int64Deobfuscate(int64(numID)),
+	); err != nil {
+		if err == sql.ErrNoRows {
+			logrus.WithField("id", id).Error("seedling not found")
+			http.Error(w, "seedling not found", http.StatusNotFound)
+			return
+		}
+		logrus.WithField("error", err).Error("failed to get seedling")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
 	if _, err := db.ExecContext(
 		r.Context(),
 		"DELETE FROM seedlings WHERE id = $1",
 		hide.Default.Int64Deobfuscate(int64(numID)),
 	); err != nil {
+		logrus.WithField("error", err).Error("failed to delete seedling")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// do a git rm -r repos/seedlings/s.description
+	// and do a git commit -am "delete seedling"
+	cmd := exec.Command("git", "rm", "-r", seedling.Name)
+	cmd.Dir = "./repos/default"
+	if err := cmd.Run(); err != nil {
+		logrus.WithField("error", err).Error("failed to delete seedling")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	cmd = exec.Command("git", "commit", "-am", "delete seedling")
+	cmd.Dir = "./repos/default"
+	if err := cmd.Run(); err != nil {
 		logrus.WithField("error", err).Error("failed to delete seedling")
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
@@ -562,45 +598,135 @@ func ListSeedlings(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func gpt_thread(seedlingDesc string, expectedOutput string) string {
-	c := gogpt.NewClient(os.Getenv("OPENAI_API_KEY"))
+func gptThread(seedling Seedling) {
 	ctx := context.Background()
+	c := gogpt.NewClient(os.Getenv("OPENAI_API_KEY"))
+	maxErrs := 5
+	step := 0
+	steps := []string{
+		SeedlingStepProtobufs,
+		SeedlingStepServer,
+		SeedlingStepDockerfile,
+		SeedlingStepComplete,
+	}
 
-	maxRuns := 5
+	errs := 0
+	for {
+		if steps[step] == SeedlingStepComplete {
+			break
+		}
 
-	// our instructions for service are written here
-	thread := seedlingDesc
-	threadStartSeq := "```go"
+		prompt := ""
+		repoPath := ""
+		codeType := ""
+		cmdCmd := ""
+		cmdArgs := []string{}
 
-	thread += " Use markdown.\n\n" + threadStartSeq
+		switch steps[step] {
+		case SeedlingStepProtobufs:
+			prompt = fmt.Sprintf(`%s
+Use markdown and include only the file requested.
+`+"```proto", fmt.Sprintf(
+				protoPrompt,
+				seedling.Description,
+				seedling.Name,
+				seedling.Name,
+			))
+			repoPath = filepath.Join("protobufs", seedling.Name+".proto")
+			codeType = "proto"
+			cmdCmd = "protoc"
+			cmdArgs = []string{
+				"-I=.",
+				"--go_out=.",
+				"--go-grpc_out=.",
+				repoPath,
+			}
+		default:
+			logrus.WithField("step", steps[step]).Error("unknown step")
+			return
+		}
 
-	// loop until runs is 0
-	for i := 0; i < maxRuns; i++ {
+		file := filepath.Join(
+			"repos",
+			"default",
+			seedling.Name,
+			repoPath,
+		)
 
-		gptOutput := gpt(c, ctx, thread)
+		for {
+			buildCmd := exec.Command(cmdCmd, cmdArgs...)
+			buildCmd.Dir = filepath.Join(
+				"repos",
+				"default",
+				seedling.Name,
+			)
+			fmt.Println("PROMPT:")
+			fmt.Println(prompt)
+			fmt.Println()
+			gptOutput, err := gpt(ctx, c, prompt)
+			if err != nil {
+				logrus.WithField("error", err).Error("failed to get gpt output")
+				return
+			}
 
-		exec := runAndClassify(gptOutput)
+			prompt += "You replied: \n\n" + gptOutput + "\n\n"
 
-		if exec["error"] != "" {
-			thread += "\n\nI got this error: " + exec["error"]
-
-			thread += "\n\nHere is the fix for the error. Use Markdown."
-			thread += threadStartSeq
-		} else {
-			thread += "\n\nI got this output: " + exec["output"]
-			isFinishedPrompt := "I ran this code:\n\n" + gptOutput + "\n\nAnd got this output:\n\n" + exec["output"] + "\n\nMy expected output was this:\n\n" + expectedOutput + "Return the word yes or no to indicate if I got the correct output.\n\nAnswer:"
-			isFinished := gpt(c, ctx, isFinishedPrompt)
-			if isFinished == "yes" {
-				return gptOutput
+			if output, err := runSeedling(
+				file,
+				codeType,
+				buildCmd,
+				gptOutput,
+			); err != nil {
+				if output == "" {
+					logrus.WithField("error", err).Error("something went wrong on seedling run that wasn't build, exiting")
+					return
+				}
+				logrus.WithField("error", err).Fatal("Failed to run seedling")
+				errs++
+				if errs > maxErrs {
+					logrus.Info("Max errors exceeded")
+					return
+				}
+				prompt += "\n\nBut it was wrong. I got an error: " + output
+				prompt += "\n\nFix the error by writing a version that works. Use Markdown."
+				prompt += "\n\n" + "```" + codeType
 			} else {
-				thread += isFinishedPrompt + "\n\nI got the wrong output. Provide a fix to get the expected output. Use Markdown.\n\n" + threadStartSeq
+				if step+1 == len(steps) {
+					logrus.Info("Seedling run complete.")
+					return
+				}
+				spew.Dump(seedling)
+				if _, err := db.ExecContext(
+					ctx,
+					"UPDATE seedlings SET step = $1 WHERE id = $2",
+					steps[step+1],
+					seedling.ID,
+				); err != nil {
+					logrus.WithField("error", err).Error("failed to update seedling step")
+					return
+				}
+				prompt += "\n\nYou did that step correctly. Let's move on to the next step.\n\n"
+				step += 1
+				break
 			}
 		}
+
+		/*
+			if err := classifySeedlingOutput(); err != nil {
+				thread += "\n\nI got this output: " + exec["output"]
+				isFinishedPrompt := "I ran this code:\n\n" + gptOutput + "\n\nAnd got this output:\n\n" + exec["output"] + "\n\nMy expected output was this:\n\n" + expectedOutput + "Return the word yes or no to indicate if I got the correct output.\n\nAnswer:"
+				isFinished := gpt(c, ctx, isFinishedPrompt)
+				if isFinished == "yes" {
+					return
+				} else {
+					thread += isFinishedPrompt + "\n\nI got the wrong output. Provide a fix to get the expected output. Use Markdown.\n\n" + threadStartSeq
+				}
+			}
+		*/
 	}
-	return ""
 }
 
-func gpt(c *gogpt.Client, ctx context.Context, prompt string) string {
+func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
 	req := gogpt.CompletionRequest{
 		Model:     "text-davinci-003",
 		MaxTokens: 1000,
@@ -609,46 +735,48 @@ func gpt(c *gogpt.Client, ctx context.Context, prompt string) string {
 	}
 	resp, err := c.CreateCompletion(ctx, req)
 	if err != nil {
-		return ""
+		return "", err
 	}
+	fmt.Println()
+	logrus.Info("GPT RESPONSE:")
 	fmt.Println(resp.Choices[0].Text)
-	return resp.Choices[0].Text
+	fmt.Println()
+	return resp.Choices[0].Text, nil
 }
 
-func runAndClassify(code string) map[string]string {
-	// remove the markdown syntax
-	code = strings.TrimPrefix(code, "```go")
-	code = strings.TrimSuffix(code, "```")
+func runSeedling(
+	file string,
+	codeType string,
+	buildCmd *exec.Cmd,
+	gptOut string,
+) (string, error) {
+	gptOut = strings.TrimPrefix(gptOut, "```"+codeType)
+	gptOut = strings.TrimSuffix(gptOut, "```")
 
-	// format the code
-	formatted, err := format.Source([]byte(code))
+	if err := ioutil.WriteFile(file, []byte(gptOut), 0644); err != nil {
+		return "", err
+	}
+
+	byteOutput, err := buildCmd.CombinedOutput()
 	if err != nil {
-		return map[string]string{"error": err.Error(), "output": ""}
-	}
-	code = string(formatted) // convert the formatted bytes to string
-
-	// create a temporary file
-	tmpfile, err := os.CreateTemp("", "gpt-*.go")
-	if err != nil {
-		return map[string]string{"error": err.Error(), "output": ""}
-	}
-	defer os.Remove(tmpfile.Name()) // clean up
-
-	// write the code to the file
-	if _, err := tmpfile.Write([]byte(code)); err != nil {
-		return map[string]string{"error": err.Error(), "output": ""}
-	}
-	if err := tmpfile.Close(); err != nil {
-		return map[string]string{"error": err.Error(), "output": ""}
+		return string(byteOutput), err
 	}
 
-	// run the file with go run
-	cmd := exec.Command("go", "run", tmpfile.Name())
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return map[string]string{"error": stderr.String(), "output": ""}
+	gitAddCmd := exec.Command("git", "add", ".")
+	gitAddCmd.Stdout = os.Stdout
+	gitAddCmd.Stderr = os.Stderr
+	gitAddCmd.Dir = filepath.Join("repos", "default")
+	if err := gitAddCmd.Run(); err != nil {
+		return "", err
 	}
-	return map[string]string{"error": "", "output": stdout.String()}
+
+	gitCmd := exec.Command("git", "commit", "-m", "seedling update")
+	gitCmd.Stdout = os.Stdout
+	gitCmd.Stderr = os.Stderr
+	gitCmd.Dir = filepath.Join("repos", "default")
+	if err := gitCmd.Run(); err != nil {
+		return "", err
+	}
+
+	return "", nil
 }
