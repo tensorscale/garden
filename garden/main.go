@@ -96,7 +96,8 @@ module %s
 
 go 1.19
 
-For what it's worth. I hate comments. Let's avoid writing comments.
+There are some arguments and variations that a user will be likely to request.
+Make sure to include them.
 `
 )
 
@@ -281,7 +282,7 @@ func main() {
 
 func cleanFilePath(file string) string {
 	invalidCharsRegex := regexp.MustCompile(`[^\w-.]`)
-	cleanedPath := strings.ReplaceAll(file, " ", "_")
+	cleanedPath := strings.ReplaceAll(strings.TrimSpace(file), " ", "_")
 	cleanedPath = invalidCharsRegex.ReplaceAllString(cleanedPath, "")
 	return strings.ToLower(cleanedPath)
 }
@@ -352,6 +353,13 @@ networks:
     external: true
 `, dirpath, dirpath)
 	if err := ioutil.WriteFile(filepath.Join(basePath, "docker-compose.yaml"), []byte(composeContents), 0644); err != nil {
+		logrus.WithField("error", err).Error("failed to write to client")
+	}
+
+	gitignoreContents := `
+logs
+`
+	if err := ioutil.WriteFile(filepath.Join(basePath, ".gitignore"), []byte(gitignoreContents), 0644); err != nil {
 		logrus.WithField("error", err).Error("failed to write to client")
 	}
 
@@ -623,12 +631,13 @@ func gptThread(seedling Seedling) {
 		codeType := ""
 		cmdCmd := ""
 		cmdArgs := []string{}
+		logrus.Warn("step: ", steps[step])
 
 		switch steps[step] {
 		case SeedlingStepProtobufs:
 			prompt = fmt.Sprintf(`%s
-Use markdown and include only the file requested.
-`+"```proto", fmt.Sprintf(
+Write the code. Write only the code.
+`+"```protobuf", fmt.Sprintf(
 				protoPrompt,
 				seedling.Description,
 				seedling.Name,
@@ -645,16 +654,16 @@ Use markdown and include only the file requested.
 			}
 		case SeedlingStepServer:
 			prompt = fmt.Sprintf(`%s
-Now write a server implementation for the service method(s).
+Now we will write a server implementation for the service method(s).
 
-1. Feel free to use external libraries, packages, and binaries. We will install
-them for you.
-2. Assume you are running in a Docker container (Linux).
-3. Have the service listen on port 80, with insecure connection settings.
+1. We can use external libraries, packages, and binaries.
+2. We assume we are running in a Docker container (Linux).
+3. We will have the service listen on port 80, with insecure connection settings.
+4. Our code will be efficient, and performant. It will use relevant algorithms and data structures.
 
 Think step by step -- what's the best way to solve the problem?
 
-Use markdown and include only the file requested.
+Write the code. Write only the code.
 `+"```go", prompt)
 			repoPath = filepath.Join("server", "main.go")
 			codeType = "go"
@@ -664,16 +673,47 @@ Use markdown and include only the file requested.
 			prompt = fmt.Sprintf(`%s
 Now write a Dockerfile (multi-stage build) to build and run your server.
 
-Use debian:bookworm-slim as the base image for both stages.
+Here is an example:
+
+FROM debian:bookworm-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  golang \
+  git \
+  protobuf-compiler \
+  ca-certificates
+WORKDIR /app
+COPY go.mod .
+RUN go mod tidy && go mod download
+COPY protobufs/<service>.proto protobufs/
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest && \
+  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+ENV PATH="/root/go/bin:${PATH}"
+RUN protoc --go_out=. --go_opt=paths=source_relative \
+  --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+  protobufs/<service>.proto
+COPY server/*.go .
+RUN go get ./...
+RUN go build -o server .
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  <package_1> \
+  <package_2>
+COPY --from=builder /app/server /app/server
+WORKDIR /app
+CMD ["./server"]
 
 Make sure to install any external libraries, packages, and binaries you need.
 
-Calculate the go.sum, don't COPY it. Make sure to do go get all required
-modules.
+Make sure to include this line:
+
+RUN go get ./...
 
 Think step by step -- what's the best way to build the file?
 
-Use markdown and include only the file requested.
+Write the code. Write only the code.
 `+"```dockerfile", prompt)
 			repoPath = filepath.Join("Dockerfile")
 			codeType = "dockerfile"
@@ -715,8 +755,6 @@ Use markdown and include only the file requested.
 
 			fmt.Println(gptOutput)
 
-			prompt += "\n\n" + gptOutput + "\n\n"
-
 			if output, err := runSeedling(
 				file,
 				codeType,
@@ -741,9 +779,22 @@ Use markdown and include only the file requested.
 				}
 				output = strings.Join(lines, "\n")
 
-				prompt += "\n\nBut it was wrong. I got an error: " + output
-				prompt += "\n\nChange the file to fix it. We'll write the whole file again. Only code. No comments."
-				prompt += "\n\n" + "```" + codeType
+				prompt += "\n\nWe want to avoid errors like: " + output
+				prompt += "\n\nWe know code that will work.\nLet's write the correct code.\n We'll what we did for this step:\n\n" + codeType
+
+				// Go back to server for now in case there are compiler errors
+				if step > 1 {
+					step = 1
+				}
+				if _, err := db.ExecContext(
+					ctx,
+					"UPDATE seedlings SET step = $1 WHERE id = $2",
+					steps[step],
+					seedling.ID,
+				); err != nil {
+					logrus.WithField("error", err).Error("failed to update seedling step")
+					return
+				}
 			} else {
 				if step+1 == len(steps) {
 					logrus.Info("Seedling run complete.")
@@ -758,6 +809,7 @@ Use markdown and include only the file requested.
 					logrus.WithField("error", err).Error("failed to update seedling step")
 					return
 				}
+				prompt += "\n\n" + gptOutput + "\n\n"
 				prompt += "\n\nGreat. That worked. Let's move on to the next step.\n\n"
 				step += 1
 				break
@@ -796,7 +848,7 @@ func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
 	}
 
 	fmt.Println()
-	logrus.WithField("finishReason", resp.Choices[0].FinishReason).Info("GOT GPT RESPONSE")
+	logrus.WithField("finishReason", resp.Choices[0].FinishReason).Warn("GOT GPT RESPONSE")
 	fmt.Println("========= GPT OUT =========")
 	fmt.Println(resp.Choices[0].Text)
 	fmt.Println("===========================")
