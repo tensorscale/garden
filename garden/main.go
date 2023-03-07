@@ -653,6 +653,7 @@ Write the code. Write only the code.
 				repoPath,
 			}
 		case SeedlingStepServer:
+			logrus.Warn("re-baking prompt for server")
 			prompt = fmt.Sprintf(`%s
 Now we will write a server implementation for the service method(s).
 
@@ -667,8 +668,11 @@ Write the code. Write only the code.
 `+"```go", prompt)
 			repoPath = filepath.Join("server", "main.go")
 			codeType = "go"
-			cmdCmd = "true"
-			cmdArgs = []string{}
+			cmdCmd = "sh"
+			cmdArgs = []string{
+				"-c",
+				"go get ./... && go build -o /tmp/server ./server",
+			}
 		case SeedlingStepDockerfile:
 			prompt = fmt.Sprintf(`%s
 Now write a Dockerfile (multi-stage build) to build and run your server.
@@ -718,14 +722,23 @@ Write the code. Write only the code.
 			repoPath = filepath.Join("Dockerfile")
 			codeType = "dockerfile"
 			cmdCmd = "docker"
-			cmdArgs = []string{
-				"buildx",
-				"build",
-				"--platform",
-				"linux/amd64",
-				"-t",
-				seedling.Name,
-				".",
+			if runtime.GOARCH == "arm64" && runtime.GOOS == "darwin" {
+				cmdArgs = []string{
+					"buildx",
+					"build",
+					"--platform",
+					"linux/amd64",
+					"-t",
+					seedling.Name,
+					".",
+				}
+			} else {
+				cmdArgs = []string{
+					"build",
+					"-t",
+					seedling.Name,
+					".",
+				}
 			}
 		default:
 			logrus.WithField("step", steps[step]).Error("unknown step")
@@ -738,82 +751,66 @@ Write the code. Write only the code.
 			seedling.Name,
 			repoPath,
 		)
+		buildCmd := exec.Command(cmdCmd, cmdArgs...)
+		buildCmd.Dir = filepath.Join(
+			"repos",
+			"default",
+			seedling.Name,
+		)
 
-		for {
-			buildCmd := exec.Command(cmdCmd, cmdArgs...)
-			buildCmd.Dir = filepath.Join(
-				"repos",
-				"default",
-				seedling.Name,
-			)
+		gptOutput, err := gpt(ctx, c, prompt)
+		if err != nil {
+			logrus.WithField("error", err).Error("failed to get gpt output")
+			return
+		}
 
-			gptOutput, err := gpt(ctx, c, prompt)
-			if err != nil {
-				logrus.WithField("error", err).Error("failed to get gpt output")
+		logrus.Warn("GPT OUT")
+		fmt.Println(gptOutput)
+		logrus.Warn("GPT OUT END")
+
+		if output, err := runSeedling(
+			file,
+			codeType,
+			buildCmd,
+			gptOutput,
+		); err != nil {
+			spew.Dump(buildCmd)
+			fmt.Println(output)
+			if output == "" {
+				logrus.WithField("error", err).Error("something went wrong on seedling run that wasn't build, exiting")
+				return
+			}
+			errs++
+			if errs > maxErrs {
+				logrus.Error("Max errors exceeded")
 				return
 			}
 
-			fmt.Println(gptOutput)
-
-			if output, err := runSeedling(
-				file,
-				codeType,
-				buildCmd,
-				gptOutput,
-			); err != nil {
-				spew.Dump(buildCmd)
-				fmt.Println(output)
-				if output == "" {
-					logrus.WithField("error", err).Error("something went wrong on seedling run that wasn't build, exiting")
-					return
-				}
-				errs++
-				if errs > maxErrs {
-					logrus.Error("Max errors exceeded")
-					return
-				}
-
-				lines := strings.Split(output, "\n")
-				if len(lines) > 10 {
-					lines = lines[len(lines)-10:]
-				}
-				output = strings.Join(lines, "\n")
-
-				prompt += "\n\nWe want to avoid errors like: " + output
-				prompt += "\n\nWe know code that will work.\nLet's write the correct code.\n We'll what we did for this step:\n\n" + codeType
-
-				// Go back to server for now in case there are compiler errors
-				if step > 1 {
-					step = 1
-				}
-				if _, err := db.ExecContext(
-					ctx,
-					"UPDATE seedlings SET step = $1 WHERE id = $2",
-					steps[step],
-					seedling.ID,
-				); err != nil {
-					logrus.WithField("error", err).Error("failed to update seedling step")
-					return
-				}
-			} else {
-				if step+1 == len(steps) {
-					logrus.Info("Seedling run complete.")
-					return
-				}
-				if _, err := db.ExecContext(
-					ctx,
-					"UPDATE seedlings SET step = $1 WHERE id = $2",
-					steps[step+1],
-					seedling.ID,
-				); err != nil {
-					logrus.WithField("error", err).Error("failed to update seedling step")
-					return
-				}
-				prompt += "\n\n" + gptOutput + "\n\n"
-				prompt += "\n\nGreat. That worked. Let's move on to the next step.\n\n"
-				step += 1
-				break
+			lines := strings.Split(output, "\n")
+			if len(lines) > 10 {
+				lines = lines[len(lines)-10:]
 			}
+			output = strings.Join(lines, "\n")
+
+			prompt += "```\n\nWe want to avoid errors like: " + output
+			prompt += "\n\nWe know code that will work.\nLet's write the correct code instead. I'll repeat the specification below.\n"
+		} else {
+			if step+1 == len(steps) {
+				logrus.Info("Seedling run complete.")
+				return
+			}
+			if _, err := db.ExecContext(
+				ctx,
+				"UPDATE seedlings SET step = $1 WHERE id = $2",
+				steps[step+1],
+				seedling.ID,
+			); err != nil {
+				logrus.WithField("error", err).Error("failed to update seedling step")
+				return
+			}
+			prompt += "\n\n" + gptOutput + "\n\n"
+			prompt += "```\n\nGreat. That worked. Let's move on to the next step.\n\n"
+			step += 1
 		}
 
 		/*
