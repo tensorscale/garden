@@ -6,6 +6,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"io/ioutil"
 	mathrand "math/rand"
 	"net/http"
@@ -653,9 +657,38 @@ Write the code. Write only the code.
 				repoPath,
 			}
 		case SeedlingStepServer:
-			logrus.Warn("re-baking prompt for server")
+			protoFile := filepath.Join(
+				"repos",
+				"default",
+				seedling.Name,
+				"protobufs",
+				seedling.Name+".pb.go",
+			)
+			protoBufDefs, err := getStructDefinitionsFromFile(protoFile)
+			if err != nil {
+				logrus.Fatal(err)
+			}
+			grpcFile := filepath.Join(
+				"repos",
+				"default",
+				seedling.Name,
+				"protobufs",
+				seedling.Name+"_grpc.pb.go",
+			)
+			grpcDefs, err := getStructDefinitionsFromFile(grpcFile)
+			if err != nil {
+				logrus.Fatal(err)
+			}
 			prompt = fmt.Sprintf(`%s
 Now we will write a server implementation for the service method(s).
+
+The generated protobuf code looks like this:
+
+%s
+
+And grpc:
+
+%s
 
 1. We can use external libraries, packages, and binaries.
 2. We assume we are running in a Docker container (Linux).
@@ -664,8 +697,12 @@ Now we will write a server implementation for the service method(s).
 
 Think step by step -- what's the best way to solve the problem?
 
+Make sure it's an actual production implementation of the service.
+
+Make sure to include all imports you need in the import section. Double check those imports.
+
 Write the code. Write only the code.
-`+"```go", prompt)
+`+"```go", prompt, strings.Join(protoBufDefs, "\n"), strings.Join(grpcDefs, "\n"))
 			repoPath = filepath.Join("server", "main.go")
 			codeType = "go"
 			cmdCmd = "sh"
@@ -787,13 +824,13 @@ Write the code. Write only the code.
 			}
 
 			lines := strings.Split(output, "\n")
-			if len(lines) > 10 {
-				lines = lines[len(lines)-10:]
+			if len(lines) > 25 {
+				lines = lines[len(lines)-25:]
 			}
 			output = strings.Join(lines, "\n")
 
-			prompt += "```\n\nWe want to avoid errors like: " + output
-			prompt += "\n\nWe know code that will work.\nLet's write the correct code instead. I'll repeat the specification below.\n"
+			prompt += "```This code didn't work:\n```" + codeType + "\n" + gptOutput + "```\n\nIt got an error: \n" + output
+			prompt += "\n\nFix the code. I'll repeat the specification below.\n"
 		} else {
 			if step+1 == len(steps) {
 				logrus.Info("Seedling run complete.")
@@ -834,7 +871,8 @@ func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
 	fmt.Println("===========================")
 
 	req := gogpt.CompletionRequest{
-		Model:     "text-alpha-002-latest",
+		Model: "text-alpha-002-longcontext-0818",
+		// Model:     "text-alpha-002-latest",
 		MaxTokens: 2048,
 		Prompt:    prompt,
 		Stop:      []string{"```"},
@@ -888,4 +926,37 @@ func runSeedling(
 	}
 
 	return "", nil
+}
+
+func getStructDefinitionsFromFile(filepath string) ([]string, error) {
+	fileContents, err := ioutil.ReadFile(filepath)
+	if err != nil {
+		return nil, err
+	}
+
+	set := token.NewFileSet()
+	parsedFile, err := parser.ParseFile(set, "", string(fileContents), parser.ParseComments)
+	if err != nil {
+		return nil, err
+	}
+
+	structDefs := make([]string, 0)
+	for _, decl := range parsedFile.Decls {
+		if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.TYPE {
+			for _, spec := range genDecl.Specs {
+				if typeSpec, ok := spec.(*ast.TypeSpec); ok {
+					if structType, ok := typeSpec.Type.(*ast.StructType); ok {
+						var structDef bytes.Buffer
+						err := printer.Fprint(&structDef, set, structType)
+						if err != nil {
+							return nil, err
+						}
+						structDefs = append(structDefs, structDef.String())
+					}
+				}
+			}
+		}
+	}
+
+	return structDefs, nil
 }
