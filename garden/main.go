@@ -36,6 +36,7 @@ import (
 	"github.com/urfave/cli"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	"golang.org/x/tools/go/packages"
 )
 
 const (
@@ -80,7 +81,7 @@ type (
 
 var (
 	protoPrompt = `
-Write me a protobufs file for a method that %s
+Write me a protobufs file for a gRPC method that %s
 
 Make sure to start it with lines like:
 
@@ -664,7 +665,7 @@ Write the code. Write only the code.
 				"protobufs",
 				seedling.Name+".pb.go",
 			)
-			protoBufDefs, err := getStructDefinitionsFromFile(protoFile)
+			protoBufDefs, err := getStructAndInterfaceDefinitionsFromFile(protoFile)
 			if err != nil {
 				logrus.Fatal(err)
 			}
@@ -675,34 +676,60 @@ Write the code. Write only the code.
 				"protobufs",
 				seedling.Name+"_grpc.pb.go",
 			)
-			grpcDefs, err := getStructDefinitionsFromFile(grpcFile)
+			grpcDefs, err := getStructAndInterfaceDefinitionsFromFile(grpcFile)
 			if err != nil {
 				logrus.Fatal(err)
 			}
+			serverFile := filepath.Join(
+				"repos",
+				"default",
+				seedling.Name,
+				"protobufs",
+				"server",
+				"main.go",
+			)
+
+			libDefs, err := getNonStandardLibraryDefinitionsFromFile(serverFile)
+			if err != nil {
+				logrus.Fatal(err)
+			}
+
 			prompt = fmt.Sprintf(`%s
 Now we will write a server implementation for the service method(s).
 
-The generated protobuf code looks like this:
+Here are library methods etc. that might be useful:
 
 %s
 
-And grpc:
+Some of the generated protobuf code looks like this:
+
+%s
+
+And the gRPC:
 
 %s
 
 1. We can use external libraries, packages, and binaries.
 2. We assume we are running in a Docker container (Linux).
-3. We will have the service listen on port 80, with insecure connection settings.
-4. Our code will be efficient, and performant. It will use relevant algorithms and data structures.
+3. We will have the service listen on port 8000, with insecure connection
+   settings.
+4. Our code will be efficient, and performant. It will use relevant algorithms
+   and data structures.
+5. In the same file, also include an HTTP server that will listen on port 8001,
+   take in JSON equivalent to the gRPC call, and call the equivalent gRPC
+   server method.
 
 Think step by step -- what's the best way to solve the problem?
 
 Make sure it's an actual production implementation of the service.
 
-Make sure to include all imports you need in the import section. Double check those imports.
+Implement everything. Don't leave anything out.
+
+Make sure to include all imports you need in the import section. Double check
+those imports.
 
 Write the code. Write only the code.
-`+"```go", prompt, strings.Join(protoBufDefs, "\n"), strings.Join(grpcDefs, "\n"))
+`+"```go", prompt, strings.Join(libDefs, "\n"), strings.Join(protoBufDefs, "\n"), strings.Join(grpcDefs, "\n"))
 			repoPath = filepath.Join("server", "main.go")
 			codeType = "go"
 			cmdCmd = "sh"
@@ -928,35 +955,104 @@ func runSeedling(
 	return "", nil
 }
 
-func getStructDefinitionsFromFile(filepath string) ([]string, error) {
+func getStructAndInterfaceDefinitionsFromFile(filepath string) ([]string, error) {
+	// Read the file contents into a []byte
 	fileContents, err := ioutil.ReadFile(filepath)
 	if err != nil {
 		return nil, err
 	}
 
+	// Initialize the token set and parser
 	set := token.NewFileSet()
 	parsedFile, err := parser.ParseFile(set, "", string(fileContents), parser.ParseComments)
 	if err != nil {
 		return nil, err
 	}
 
-	structDefs := make([]string, 0)
+	// Traverse the AST and collect all struct and interface definitions
+	typeDefs := make([]string, 0)
 	for _, decl := range parsedFile.Decls {
 		if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.TYPE {
 			for _, spec := range genDecl.Specs {
-				if typeSpec, ok := spec.(*ast.TypeSpec); ok {
-					if structType, ok := typeSpec.Type.(*ast.StructType); ok {
-						var structDef bytes.Buffer
-						err := printer.Fprint(&structDef, set, structType)
+				switch typeSpec := spec.(type) {
+				case *ast.TypeSpec:
+					switch typeSpec.Type.(type) {
+					case *ast.StructType, *ast.InterfaceType:
+						// Print the *ast.TypeSpec to a string using go/printer
+						var typeDef bytes.Buffer
+						err := printer.Fprint(&typeDef, set, typeSpec)
 						if err != nil {
 							return nil, err
 						}
-						structDefs = append(structDefs, structDef.String())
+						typeDefs = append(typeDefs, typeDef.String())
 					}
 				}
 			}
 		}
 	}
 
-	return structDefs, nil
+	return typeDefs, nil
+}
+
+func getNonStandardLibraryDefinitionsFromFile(filename string) ([]string, error) {
+	// Load the packages and their dependencies
+	cfg := &packages.Config{
+		Mode: packages.LoadAllSyntax,
+	}
+	pkgs, err := packages.Load(cfg, filename)
+	if err != nil {
+		return nil, err
+	}
+
+	// Traverse the packages and collect all non-standard library method, struct, and interface definitions
+	typeDefs := make([]string, 0)
+	for _, pkg := range pkgs {
+		if !strings.HasPrefix(pkg.PkgPath, "std") {
+			fmt.Printf("Found non-standard library package: %s\n", pkg.PkgPath)
+			for _, file := range pkg.Syntax {
+				fmt.Printf("Analyzing file: %s\n", pkg.Fset.File(file.Pos()).Name())
+				// Traverse the file's AST and collect all method, struct, and interface definitions
+				fileSet := token.NewFileSet()
+				for _, decl := range file.Decls {
+					switch decl := decl.(type) {
+					case *ast.FuncDecl:
+						if decl.Recv != nil {
+							typeDefs = append(typeDefs, fmt.Sprintf("%s.%s", pkg.PkgPath, decl.Name.Name))
+							fmt.Printf("Found method: %s.%s\n", pkg.PkgPath, decl.Name.Name)
+						}
+					case *ast.GenDecl:
+						if decl.Tok == token.TYPE {
+							for _, spec := range decl.Specs {
+								if typeSpec, ok := spec.(*ast.TypeSpec); ok {
+									if structType, ok := typeSpec.Type.(*ast.StructType); ok {
+										// Print the *ast.StructType to a string using go/printer
+										var structDef bytes.Buffer
+										err := printer.Fprint(&structDef, fileSet, structType)
+										if err != nil {
+											return nil, err
+										}
+										typeDefs = append(typeDefs, fmt.Sprintf("%s.%s", pkg.PkgPath, typeSpec.Name.Name))
+										typeDefs = append(typeDefs, structDef.String())
+										fmt.Printf("Found struct: %s.%s\n", pkg.PkgPath, typeSpec.Name.Name)
+									} else if interfaceType, ok := typeSpec.Type.(*ast.InterfaceType); ok {
+										// Print the *ast.InterfaceType to a string using go/printer
+										var interfaceDef bytes.Buffer
+										err := printer.Fprint(&interfaceDef, fileSet, interfaceType)
+										if err != nil {
+											return nil, err
+										}
+										typeDefs = append(typeDefs, fmt.Sprintf("%s.%s", pkg.PkgPath, typeSpec.Name.Name))
+										typeDefs = append(typeDefs, interfaceDef.String())
+										fmt.Printf("Found interface: %s.%s\n", pkg.PkgPath, typeSpec.Name.Name)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return typeDefs, nil
 }
