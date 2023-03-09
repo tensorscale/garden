@@ -36,7 +36,6 @@ import (
 	"github.com/urfave/cli"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
-	"golang.org/x/tools/go/packages"
 )
 
 const (
@@ -44,14 +43,15 @@ const (
 )
 
 var (
-	log                       *logrus.Entry
-	db                        *sqlx.DB
-	SeedlingStepProtobufs     = "SeedlingStepProtobufs"
-	SeedlingStepServer        = "SeedlingStepServer"
-	SeedlingStepDockerfile    = "SeedlingStepDockerfile"
-	SeedlingStepDockerCompose = "SeedlingStepDockerCompose"
-	SeedlingStepClient        = "SeedlingStepClient"
-	SeedlingStepComplete      = "SeedlingStepComplete"
+	log                           *logrus.Entry
+	db                            *sqlx.DB
+	SeedlingStepProtobufs         = "SeedlingStepProtobufs"
+	SeedlingStepServer            = "SeedlingStepServer"
+	SeedlingStepDockerfile        = "SeedlingStepDockerfile"
+	SeedlingStepDockerCompose     = "SeedlingStepDockerCompose"
+	SeedlingStepClient            = "SeedlingStepClient"
+	SeedlingStepExampleClientCall = "SeedlingStepExampleClientCall"
+	SeedlingStepComplete          = "SeedlingStepComplete"
 )
 
 type DBRow struct {
@@ -102,7 +102,8 @@ module %s
 go 1.19
 
 There are some arguments and variations that a user will be likely to request.
-Make sure to include them.
+Make sure to include them. Think about it comprehensively -- what are people likely
+to want from a service that does %s?
 `
 )
 
@@ -616,19 +617,69 @@ func ListSeedlings(w http.ResponseWriter, r *http.Request) {
 func gptThread(seedling Seedling) {
 	ctx := context.Background()
 	c := gogpt.NewClient(os.Getenv("OPENAI_API_KEY"))
-	maxErrs := 5
+	maxErrs := 15
 	step := 0
 	steps := []string{
 		SeedlingStepProtobufs,
 		SeedlingStepServer,
 		SeedlingStepDockerfile,
+		SeedlingStepExampleClientCall,
 		SeedlingStepComplete,
 	}
 
 	errs := 0
 	prompt := ""
+	errMode := false
+	seedlingPort := ""
 	for {
 		if steps[step] == SeedlingStepComplete {
+			cmd := exec.Command("docker", "run",
+				"--init",
+				"--name", seedling.Name,
+				"-d",
+				"-p", "8001",
+				"-p", "8000",
+				seedling.Name,
+			)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				logrus.WithField("error", err).Error("failed to run docker container")
+				return
+			}
+
+			cid := strings.TrimSpace(string(out))
+
+			cmd = exec.Command("docker", "inspect", cid)
+			out, err = cmd.CombinedOutput()
+			if err != nil {
+				logrus.WithField("error", err).Error("failed to run docker container")
+				return
+			}
+
+			var inspect []struct {
+				NetworkSettings struct {
+					Ports map[string][]struct {
+						HostPort string `json:"HostPort"`
+					} `json:"Ports"`
+				} `json:"NetworkSettings"`
+			}
+			if err := json.Unmarshal(out, &inspect); err != nil {
+				logrus.WithField("error", err).Error("failed to run docker container")
+				return
+			}
+
+			// get port for 8001 from inspect output
+			for _, port := range inspect[0].NetworkSettings.Ports["8001/tcp"] {
+				if port.HostPort != "" {
+					seedlingPort = port.HostPort
+					break
+				}
+			}
+
+			logrus.WithField("n_errs", errs).
+				WithField("container_id", cid).
+				WithField("container_ports", inspect[0].NetworkSettings.Ports["8001/tcp"][0]).
+				Info("Seedling build complete. Launching Docker container for seedling")
 			break
 		}
 
@@ -640,14 +691,18 @@ func gptThread(seedling Seedling) {
 
 		switch steps[step] {
 		case SeedlingStepProtobufs:
-			prompt = fmt.Sprintf(`%s
-Write the code. Write only the code.
-`+"```protobuf", fmt.Sprintf(
-				protoPrompt,
-				seedling.Description,
-				seedling.Name,
-				seedling.Name,
-			))
+			if !errMode {
+				prompt = fmt.Sprintf("%s\n", fmt.Sprintf(
+					protoPrompt,
+					seedling.Description,
+					seedling.Name,
+					seedling.Name,
+					seedling.Description,
+				))
+			} else {
+				errMode = false
+			}
+			prompt += "```protobuf\n"
 			repoPath = filepath.Join("protobufs", seedling.Name+".proto")
 			codeType = "proto"
 			cmdCmd = "protoc"
@@ -657,6 +712,7 @@ Write the code. Write only the code.
 				"--go-grpc_out=.",
 				repoPath,
 			}
+
 		case SeedlingStepServer:
 			protoFile := filepath.Join(
 				"repos",
@@ -684,22 +740,13 @@ Write the code. Write only the code.
 				"repos",
 				"default",
 				seedling.Name,
-				"protobufs",
 				"server",
 				"main.go",
 			)
 
-			libDefs, err := getNonStandardLibraryDefinitionsFromFile(serverFile)
-			if err != nil {
-				logrus.Fatal(err)
-			}
-
-			prompt = fmt.Sprintf(`%s
-Now we will write a server implementation for the service method(s).
-
-Here are library methods etc. that might be useful:
-
-%s
+			if !errMode {
+				prompt = fmt.Sprintf(`%s
+Now write a server implementation for the service method(s).
 
 Some of the generated protobuf code looks like this:
 
@@ -709,27 +756,47 @@ And the gRPC:
 
 %s
 
-1. We can use external libraries, packages, and binaries.
-2. We assume we are running in a Docker container (Linux).
-3. We will have the service listen on port 8000, with insecure connection
+Here are some instructions:
+
+1. Use external libraries, packages, and binaries if needed.
+2. Assume you are running in a Docker container (Linux).
+3. Make the gRPC service listen on port 8000, with insecure connection
    settings.
-4. Our code will be efficient, and performant. It will use relevant algorithms
-   and data structures.
+4. Make the code efficient, and performant. Use relevant algorithms
+   and data structures if needed.
 5. In the same file, also include an HTTP server that will listen on port 8001,
    take in JSON equivalent to the gRPC call, and call the equivalent gRPC
    server method.
+6. Use logrus for logging, and log every HTTP and gRPC call with some details.
 
-Think step by step -- what's the best way to solve the problem?
+Think step by step.
 
-Make sure it's an actual production implementation of the service.
-
-Implement everything. Don't leave anything out.
+Make sure it's an actual production implementation of the service. Implement
+everything. Don't leave anything out.
 
 Make sure to include all imports you need in the import section. Double check
 those imports.
+`, prompt, strings.Join(protoBufDefs, "\n"), strings.Join(grpcDefs, "\n"))
+			} else {
+				errMode = false
+				nonStdImports := getNonStdImports(serverFile)
+				allDocs := "\nHere are library methods etc. that might be useful:\n"
+				for _, imp := range nonStdImports {
+					cmd := exec.Command("go", "doc", imp)
+					cmd.Dir = filepath.Join("repos", "default", seedling.Name)
+					out, err := cmd.CombinedOutput()
+					if err != nil {
+						logrus.WithField("error", err).Error("failed to run go doc, output below")
+						spew.Dump(cmd)
+						fmt.Println(string(out))
+						return
+					}
+					allDocs += string(out)
+				}
+				prompt += allDocs
+			}
 
-Write the code. Write only the code.
-`+"```go", prompt, strings.Join(libDefs, "\n"), strings.Join(protoBufDefs, "\n"), strings.Join(grpcDefs, "\n"))
+			prompt += "```go\n"
 			repoPath = filepath.Join("server", "main.go")
 			codeType = "go"
 			cmdCmd = "sh"
@@ -738,7 +805,8 @@ Write the code. Write only the code.
 				"go get ./... && go build -o /tmp/server ./server",
 			}
 		case SeedlingStepDockerfile:
-			prompt = fmt.Sprintf(`%s
+			if !errMode {
+				prompt = fmt.Sprintf(`%s
 Now write a Dockerfile (multi-stage build) to build and run your server.
 
 Here is an example:
@@ -762,16 +830,16 @@ RUN protoc --go_out=. --go_opt=paths=source_relative \
   protobufs/<service>.proto
 COPY server/*.go .
 RUN go get ./...
-RUN go build -o server .
+RUN go build -o /app/svcbin .
 
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   <package_1> \
   <package_2>
-COPY --from=builder /app/server /app/server
+COPY --from=builder /app/svcbin /app/svcbin
 WORKDIR /app
-CMD ["./server"]
+CMD ["./svcbin"]
 
 Make sure to install any external libraries, packages, and binaries you need.
 
@@ -782,7 +850,11 @@ RUN go get ./...
 Think step by step -- what's the best way to build the file?
 
 Write the code. Write only the code.
-`+"```dockerfile", prompt)
+`, prompt)
+			} else {
+				errMode = false
+			}
+			prompt += "```dockerfile\n"
 			repoPath = filepath.Join("Dockerfile")
 			codeType = "dockerfile"
 			cmdCmd = "docker"
@@ -804,6 +876,20 @@ Write the code. Write only the code.
 					".",
 				}
 			}
+		case SeedlingStepExampleClientCall:
+			if !errMode {
+				prompt = fmt.Sprintf(`%s
+Now write me a shell script with a example client call to the HTTP service,
+which is running on localhost:%s.
+`, prompt, seedlingPort)
+			} else {
+				errMode = false
+			}
+			prompt += "```bash\n"
+			repoPath = filepath.Join("example-client-call.sh")
+			codeType = "bash"
+			cmdCmd = "true" // don't bother to verify for now
+			cmdArgs = []string{}
 		default:
 			logrus.WithField("step", steps[step]).Error("unknown step")
 			return
@@ -828,18 +914,12 @@ Write the code. Write only the code.
 			return
 		}
 
-		logrus.Warn("GPT OUT")
-		fmt.Println(gptOutput)
-		logrus.Warn("GPT OUT END")
-
 		if output, err := runSeedling(
 			file,
 			codeType,
 			buildCmd,
 			gptOutput,
 		); err != nil {
-			spew.Dump(buildCmd)
-			fmt.Println(output)
 			if output == "" {
 				logrus.WithField("error", err).Error("something went wrong on seedling run that wasn't build, exiting")
 				return
@@ -857,12 +937,9 @@ Write the code. Write only the code.
 			output = strings.Join(lines, "\n")
 
 			prompt += "```This code didn't work:\n```" + codeType + "\n" + gptOutput + "```\n\nIt got an error: \n" + output
-			prompt += "\n\nFix the code. I'll repeat the specification below.\n"
+			prompt += "\n\nWrite a version that fixes that error, and still fulfills the intended functionality.\n"
+			errMode = true
 		} else {
-			if step+1 == len(steps) {
-				logrus.Info("Seedling run complete.")
-				return
-			}
 			if _, err := db.ExecContext(
 				ctx,
 				"UPDATE seedlings SET step = $1 WHERE id = $2",
@@ -893,9 +970,9 @@ Write the code. Write only the code.
 }
 
 func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
-	fmt.Println("====== PROMPTING GPT ======")
+	logrus.Warn("====== PROMPTING GPT ======")
 	fmt.Println(prompt)
-	fmt.Println("===========================")
+	logrus.Warn("====== PROMPTING GPT END ======")
 
 	req := gogpt.CompletionRequest{
 		Model: "text-alpha-002-longcontext-0818",
@@ -909,11 +986,9 @@ func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
 		return "", err
 	}
 
-	fmt.Println()
-	logrus.WithField("finishReason", resp.Choices[0].FinishReason).Warn("GOT GPT RESPONSE")
-	fmt.Println("========= GPT OUT =========")
+	logrus.WithField("finishReason", resp.Choices[0].FinishReason).Warn("====== GPT RESPONSE ======")
 	fmt.Println(resp.Choices[0].Text)
-	fmt.Println("===========================")
+	logrus.Warn("====== GPT RESPONSE END ======")
 	return resp.Choices[0].Text, nil
 }
 
@@ -929,6 +1004,12 @@ func runSeedling(
 
 	if err := ioutil.WriteFile(file, []byte(gptOut), 0644); err != nil {
 		return "", err
+	}
+
+	if codeType == "bash" {
+		if err := os.Chmod(file, 0755); err != nil {
+			return "", err
+		}
 	}
 
 	byteOutput, err := buildCmd.CombinedOutput()
@@ -994,65 +1075,24 @@ func getStructAndInterfaceDefinitionsFromFile(filepath string) ([]string, error)
 	return typeDefs, nil
 }
 
-func getNonStandardLibraryDefinitionsFromFile(filename string) ([]string, error) {
-	// Load the packages and their dependencies
-	cfg := &packages.Config{
-		Mode: packages.LoadAllSyntax,
-	}
-	pkgs, err := packages.Load(cfg, filename)
+func getNonStdImports(filepath string) []string {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filepath, nil, parser.ImportsOnly)
 	if err != nil {
-		return nil, err
+		// TODO: handle error
+		logrus.Fatal(err)
 	}
 
-	// Traverse the packages and collect all non-standard library method, struct, and interface definitions
-	typeDefs := make([]string, 0)
-	for _, pkg := range pkgs {
-		if !strings.HasPrefix(pkg.PkgPath, "std") {
-			fmt.Printf("Found non-standard library package: %s\n", pkg.PkgPath)
-			for _, file := range pkg.Syntax {
-				fmt.Printf("Analyzing file: %s\n", pkg.Fset.File(file.Pos()).Name())
-				// Traverse the file's AST and collect all method, struct, and interface definitions
-				fileSet := token.NewFileSet()
-				for _, decl := range file.Decls {
-					switch decl := decl.(type) {
-					case *ast.FuncDecl:
-						if decl.Recv != nil {
-							typeDefs = append(typeDefs, fmt.Sprintf("%s.%s", pkg.PkgPath, decl.Name.Name))
-							fmt.Printf("Found method: %s.%s\n", pkg.PkgPath, decl.Name.Name)
-						}
-					case *ast.GenDecl:
-						if decl.Tok == token.TYPE {
-							for _, spec := range decl.Specs {
-								if typeSpec, ok := spec.(*ast.TypeSpec); ok {
-									if structType, ok := typeSpec.Type.(*ast.StructType); ok {
-										// Print the *ast.StructType to a string using go/printer
-										var structDef bytes.Buffer
-										err := printer.Fprint(&structDef, fileSet, structType)
-										if err != nil {
-											return nil, err
-										}
-										typeDefs = append(typeDefs, fmt.Sprintf("%s.%s", pkg.PkgPath, typeSpec.Name.Name))
-										typeDefs = append(typeDefs, structDef.String())
-										fmt.Printf("Found struct: %s.%s\n", pkg.PkgPath, typeSpec.Name.Name)
-									} else if interfaceType, ok := typeSpec.Type.(*ast.InterfaceType); ok {
-										// Print the *ast.InterfaceType to a string using go/printer
-										var interfaceDef bytes.Buffer
-										err := printer.Fprint(&interfaceDef, fileSet, interfaceType)
-										if err != nil {
-											return nil, err
-										}
-										typeDefs = append(typeDefs, fmt.Sprintf("%s.%s", pkg.PkgPath, typeSpec.Name.Name))
-										typeDefs = append(typeDefs, interfaceDef.String())
-										fmt.Printf("Found interface: %s.%s\n", pkg.PkgPath, typeSpec.Name.Name)
-									}
-								}
-							}
-						}
-					}
-				}
-			}
+	nonStdImports := []string{}
+	for _, i := range file.Imports {
+		path := strings.Trim(i.Path.Value, `"`)
+
+		if !strings.Contains(path, ".") || strings.HasPrefix(path, ".") {
+			continue
 		}
+
+		nonStdImports = append(nonStdImports, path)
 	}
 
-	return typeDefs, nil
+	return nonStdImports
 }
