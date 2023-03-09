@@ -667,8 +667,7 @@ func gptThread(seedling Seedling) {
 
 			cid := strings.TrimSpace(string(out))
 
-			// Define the format for the output of `docker inspect`
-			format := "{{(index (index .NetworkSettings.Ports \"8001/tcp\") 0).HostPort}}"
+			format := `{{ (index .NetworkSettings.Ports "8001/tcp" 0).HostPort }}`
 
 			// Construct the `docker inspect` command
 			inspectCmd := exec.Command("docker", "inspect", "-f", format, cid)
