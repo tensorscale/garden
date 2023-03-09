@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/ast"
+	"go/doc"
+	"go/format"
 	"go/parser"
 	"go/printer"
 	"go/token"
@@ -43,15 +45,16 @@ const (
 )
 
 var (
-	log                           *logrus.Entry
-	db                            *sqlx.DB
-	SeedlingStepProtobufs         = "SeedlingStepProtobufs"
-	SeedlingStepServer            = "SeedlingStepServer"
-	SeedlingStepDockerfile        = "SeedlingStepDockerfile"
-	SeedlingStepDockerCompose     = "SeedlingStepDockerCompose"
-	SeedlingStepClient            = "SeedlingStepClient"
-	SeedlingStepExampleClientCall = "SeedlingStepExampleClientCall"
-	SeedlingStepComplete          = "SeedlingStepComplete"
+	log                            *logrus.Entry
+	db                             *sqlx.DB
+	SeedlingStepProtobufs          = "SeedlingStepProtobufs"
+	SeedlingStepServer             = "SeedlingStepServer"
+	SeedlingStepServerQualityCheck = "SeedlingStepServerQualityCheck"
+	SeedlingStepDockerfile         = "SeedlingStepDockerfile"
+	SeedlingStepDockerCompose      = "SeedlingStepDockerCompose"
+	SeedlingStepClient             = "SeedlingStepClient"
+	SeedlingStepExampleClientCall  = "SeedlingStepExampleClientCall"
+	SeedlingStepComplete           = "SeedlingStepComplete"
 )
 
 type DBRow struct {
@@ -102,12 +105,19 @@ module %s
 go 1.19
 
 There are some arguments and variations that a user will be likely to request.
-Make sure to include them. Think about it comprehensively -- what are people likely
-to want from a service that does %s?
+Make sure to include them. Think about it like a product manager for a developer experience
+-- what are people likely to want from a service that does %s?
 `
 )
 
+type QualityCheck struct {
+	Quality     string `json:"quality"`
+	Reason      string `json:"reason"`
+	Suggestions string `json:"suggestions"`
+}
+
 func init() {
+	fmt.Println(GetExamples("github.com/sirupsen/logrus"))
 	var err error
 	db, err = otelsqlx.Open("sqlite3",
 		"garden.sqlite3?cache=shared&_synchronous=normal&_journal_mode=WAL",
@@ -670,11 +680,14 @@ func gptThread(seedling Seedling) {
 
 			// get port for 8001 from inspect output
 			for _, port := range inspect[0].NetworkSettings.Ports["8001/tcp"] {
+				logrus.Error(port)
 				if port.HostPort != "" {
 					seedlingPort = port.HostPort
 					break
 				}
 			}
+
+			spew.Dump(inspect)
 
 			logrus.WithField("n_errs", errs).
 				WithField("container_id", cid).
@@ -687,6 +700,7 @@ func gptThread(seedling Seedling) {
 		codeType := ""
 		cmdCmd := ""
 		cmdArgs := []string{}
+		dumpedModDocs := false
 		logrus.Warn("step: ", steps[step])
 
 		switch steps[step] {
@@ -745,8 +759,24 @@ func gptThread(seedling Seedling) {
 			)
 
 			if !errMode {
+				/*
+					// TODO: I like this idea, but GPT hallucinates too many repos that don't exist.
+					// Maybe we can use the description to find some real repos? On Github, sourcegraph etc
+								moduleSuggestions, err := gpt(ctx, c, fmt.Sprintf(`
+						Give me three real Go modules that might be useful for a service with this description: %s.
+
+						Include them in the format:
+
+						- github.com/user/repo - description
+						...
+						`+"```", seedling.Description))
+										if err != nil {
+											logrus.Error(err)
+											return
+										}
+				*/
 				prompt = fmt.Sprintf(`%s
-Now write a server implementation for the service method(s).
+Now write a server for the service method(s).
 
 Some of the generated protobuf code looks like this:
 
@@ -759,7 +789,9 @@ And the gRPC:
 Here are some instructions:
 
 1. Use external libraries, packages, and binaries if needed.
-2. Assume you are running in a Docker container (Linux).
+2. Assume you are running in a Docker container (Linux). This will 
+   run on Debian, so make sure it's compatible with Debian (Bookworm).
+   This should be oriented at processor architecture %s.
 3. Make the gRPC service listen on port 8000, with insecure connection
    settings.
 4. Make the code efficient, and performant. Use relevant algorithms
@@ -767,33 +799,46 @@ Here are some instructions:
 5. In the same file, also include an HTTP server that will listen on port 8001,
    take in JSON equivalent to the gRPC call, and call the equivalent gRPC
    server method.
-6. Use logrus for logging, and log every HTTP and gRPC call with some details.
+6. Use logrus for logging, and log every HTTP and gRPC call with some details. Use logrus.WithField generously.
 
-Think step by step.
+Think step by step. If you want to provide commentary, do it in comments.
 
-Make sure it's an actual production implementation of the service. Implement
-everything. Don't leave anything out.
+Actually implement everything as if it were production ready.
 
-Make sure to include all imports you need in the import section. Double check
-those imports.
-`, prompt, strings.Join(protoBufDefs, "\n"), strings.Join(grpcDefs, "\n"))
+Make sure to check your imports. Double check those imports.
+`, prompt, strings.Join(protoBufDefs, "\n"), strings.Join(grpcDefs, "\n"), runtime.GOARCH)
 			} else {
 				errMode = false
-				nonStdImports := getNonStdImports(serverFile)
-				allDocs := "\nHere are library methods etc. that might be useful:\n"
-				for _, imp := range nonStdImports {
-					cmd := exec.Command("go", "doc", imp)
-					cmd.Dir = filepath.Join("repos", "default", seedling.Name)
-					out, err := cmd.CombinedOutput()
-					if err != nil {
-						logrus.WithField("error", err).Error("failed to run go doc, output below")
-						spew.Dump(cmd)
-						fmt.Println(string(out))
-						return
+				if !dumpedModDocs {
+					dumpedModDocs = true
+					nonStdImports := getNonStdImports(serverFile)
+					allDocs := "\nHere is some documentation that might be useful:\n"
+					goDocErr := false
+					mods := 0
+					for _, imp := range nonStdImports {
+						if strings.Contains(imp, "protobuf") ||
+							strings.Contains(imp, "logrus") ||
+							strings.Contains(imp, "grpc") ||
+							strings.Contains(imp, "spew") {
+							// skip for now, too spammy
+							continue
+						}
+						cmd := exec.Command("sh", "-c", "go get ./... && go doc -short "+imp)
+						cmd.Dir = filepath.Join("repos", "default", seedling.Name)
+						out, err := cmd.CombinedOutput()
+						if err != nil {
+							logrus.WithField("error", err).Error("failed to run go doc, output below")
+							goDocErr = true
+							spew.Dump(cmd)
+							fmt.Println(string(out))
+						}
+						mods++
+						allDocs += string(out)
 					}
-					allDocs += string(out)
+					if !goDocErr && mods > 0 {
+						prompt += allDocs
+					}
 				}
-				prompt += allDocs
 			}
 
 			prompt += "```go\n"
@@ -878,10 +923,23 @@ Write the code. Write only the code.
 			}
 		case SeedlingStepExampleClientCall:
 			if !errMode {
+				// ioutil readfile server/main.go
+				serverContents, err :=
+					ioutil.ReadFile(filepath.Join("repos",
+						"default", seedling.Name, "server", "main.go"))
+				if err != nil {
+					logrus.WithError(err).Error("failed to read server/main.go")
+					return
+				}
+
 				prompt = fmt.Sprintf(`%s
-Now write me a shell script with a example client call to the HTTP service,
-which is running on localhost:%s.
-`, prompt, seedlingPort)
+Now write me a shell script with a example client call with curl to the HTTP
+service, which is running on localhost:%s.
+
+Remember, the server code is:
+
+%s
+`, prompt, seedlingPort, serverContents)
 			} else {
 				errMode = false
 			}
@@ -936,10 +994,58 @@ which is running on localhost:%s.
 			}
 			output = strings.Join(lines, "\n")
 
-			prompt += "```This code didn't work:\n```" + codeType + "\n" + gptOutput + "```\n\nIt got an error: \n" + output
-			prompt += "\n\nWrite a version that fixes that error, and still fulfills the intended functionality.\n"
+			prompt += "```\nThis code didn't work:\n```" + codeType + "\n" + gptOutput + "```\n\nIt got an error: \n" + output
+			prompt += "\n\nWrite a version that fixes that error.\n"
 			errMode = true
 		} else {
+			if steps[step] == SeedlingStepServer {
+				for {
+					if errs == maxErrs {
+						logrus.Error("Max errors exceeded")
+						return
+					}
+
+					// call gpt with prompt that's basically like, "yea ok so look over the above and output JSON with a key of 'quality' and a value of 'good' or 'bad'"
+					// that way we can check if the server is actually doing what it's supposed to
+					qualityPrompt := fmt.Sprintf(`%s
+
+Now look over the above code you wrote and, based on how well it seems to implement the desired functionality (a service that %s), output JSON with this format:
+
+{"quality": "good", "reason": "would definitely pass a code review", "suggestions": "none"}
+{"quality": "bad", "reason": "unimplemented method", "suggestions": "actually implement the functionality"}
+
+The quality check should return "bad" if there are TODOs, stubs, methods that
+just return nil or true without doing anything, etc. For instance, "we'll do
+this later" is a strong indication that the code quality is "bad".
+`+"```json\n", prompt, seedling.Description)
+					qualityCheckOut, err := gpt(ctx, c, qualityPrompt)
+					if err != nil {
+						logrus.WithField("error", err).Error("failed to get gpt output")
+						return
+					}
+					qualityCheckOut = strings.TrimSpace(qualityCheckOut)
+
+					var qualityCheck QualityCheck
+					if err := json.Unmarshal([]byte(qualityCheckOut), &qualityCheck); err != nil {
+						logrus.WithField("error", err).Error("failed to unmarshal quality check")
+						errs++
+						continue
+					}
+
+					if qualityCheck.Quality != "good" {
+						prompt += "```" + fmt.Sprintf(`
+You didn't pass the quality check. Here's the output from the quality check:
+%s`, qualityCheckOut)
+						prompt += "\n\nWrite a version that fixes that error.\n"
+						errMode = true
+						break
+					}
+
+					break
+				}
+				continue
+			}
+
 			if _, err := db.ExecContext(
 				ctx,
 				"UPDATE seedlings SET step = $1 WHERE id = $2",
@@ -1095,4 +1201,58 @@ func getNonStdImports(filepath string) []string {
 	}
 
 	return nonStdImports
+}
+
+func parseAllFiles(_ os.FileInfo) bool {
+	return true
+}
+
+func GetExamples(moduleName string) (string, error) {
+	// Parse each Go file and extract examples
+	var examples []*doc.Example
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(f os.FileInfo) bool {
+		return strings.HasSuffix(f.Name(), ".go")
+	}, parser.ParseComments)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse files: %v", err)
+	}
+	for _, pkg := range pkgs {
+		pkgDoc := doc.New(pkg, moduleName, 0)
+		examples = append(examples, pkgDoc.Examples...)
+	}
+
+	// Extract source code for each example
+	var codeStrings []string
+	for _, example := range examples {
+		var buf bytes.Buffer
+		if err := format.Node(&buf, fset, example.Code); err != nil {
+			return "", fmt.Errorf("failed to format example code: %v", err)
+		}
+		codeStrings = append(codeStrings, buf.String())
+	}
+
+	// Concatenate all source code strings
+	return strings.Join(codeStrings, "\n"), nil
+}
+
+func findPackageNode(node *ast.File, fset *token.FileSet) (*ast.Package, error) {
+	// Traverse the AST to find the package declaration node
+	var pkgNode *ast.Package
+	ast.Inspect(node, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.Package:
+			pkgNode = n
+			return false // stop traversing
+		case *ast.File:
+			// We don't want to traverse into other files
+			return false
+		default:
+			return true // continue traversing
+		}
+	})
+	if pkgNode == nil {
+		return nil, fmt.Errorf("no package node found")
+	}
+	return pkgNode, nil
 }
