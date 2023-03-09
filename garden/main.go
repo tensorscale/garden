@@ -793,13 +793,9 @@ Here are some instructions:
    run on Debian, so make sure it's compatible with Debian (Bookworm).
    This should be oriented at processor architecture %s.
 3. Make the gRPC service listen on port 8000, with insecure connection
-   settings.
-4. Make the code efficient, and performant. Use relevant algorithms
-   and data structures if needed.
-5. In the same file, also include an HTTP server that will listen on port 8001,
-   take in JSON equivalent to the gRPC call, and call the equivalent gRPC
-   server method.
-6. Use logrus for logging, and log every HTTP and gRPC call with some details. Use logrus.WithField generously.
+   settings. In the same file, also include an HTTP server that will listen on
+   port 8001, take in JSON equivalent to the gRPC call, and call the equivalent
+   gRPC server method.
 
 Think step by step. If you want to provide commentary, do it in comments.
 
@@ -973,15 +969,16 @@ Remember, the server code is:
 		}
 
 		if output, err := runSeedling(
+			ctx,
 			file,
 			codeType,
 			buildCmd,
 			gptOutput,
+			steps[step],
+			prompt,
+			seedling.Description,
+			c,
 		); err != nil {
-			if output == "" {
-				logrus.WithField("error", err).Error("something went wrong on seedling run that wasn't build, exiting")
-				return
-			}
 			errs++
 			if errs > maxErrs {
 				logrus.Error("Max errors exceeded")
@@ -998,53 +995,6 @@ Remember, the server code is:
 			prompt += "\n\nWrite a version that fixes that error.\n"
 			errMode = true
 		} else {
-			if steps[step] == SeedlingStepServer {
-				for {
-					if errs == maxErrs {
-						logrus.Error("Max errors exceeded")
-						return
-					}
-
-					// call gpt with prompt that's basically like, "yea ok so look over the above and output JSON with a key of 'quality' and a value of 'good' or 'bad'"
-					// that way we can check if the server is actually doing what it's supposed to
-					qualityPrompt := fmt.Sprintf(`%s
-
-Now look over the above code you wrote and, based on how well it seems to implement the desired functionality (a service that %s), output JSON with this format:
-
-{"quality": "good", "reason": "would definitely pass a code review", "suggestions": "none"}
-{"quality": "bad", "reason": "unimplemented method", "suggestions": "actually implement the functionality"}
-
-The quality check should return "bad" if there are TODOs, stubs, methods that
-just return nil or true without doing anything, etc. For instance, "we'll do
-this later" is a strong indication that the code quality is "bad".
-`+"```json\n", prompt, seedling.Description)
-					qualityCheckOut, err := gpt(ctx, c, qualityPrompt)
-					if err != nil {
-						logrus.WithField("error", err).Error("failed to get gpt output")
-						return
-					}
-					qualityCheckOut = strings.TrimSpace(qualityCheckOut)
-
-					var qualityCheck QualityCheck
-					if err := json.Unmarshal([]byte(qualityCheckOut), &qualityCheck); err != nil {
-						logrus.WithField("error", err).Error("failed to unmarshal quality check")
-						errs++
-						continue
-					}
-
-					if qualityCheck.Quality != "good" {
-						prompt += "```" + fmt.Sprintf(`
-You didn't pass the quality check. Here's the output from the quality check:
-%s`, qualityCheckOut)
-						prompt += "\n\nWrite a version that fixes that error.\n"
-						errMode = true
-						break
-					}
-
-					break
-				}
-				continue
-			}
 
 			if _, err := db.ExecContext(
 				ctx,
@@ -1099,14 +1049,66 @@ func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
 }
 
 func runSeedling(
+	ctx context.Context,
 	file string,
 	codeType string,
 	buildCmd *exec.Cmd,
 	gptOut string,
+	step string,
+	prompt string,
+	description string,
+	c *gogpt.Client,
 ) (string, error) {
+	if step == SeedlingStepServer {
+		maxErrs := 10
+		errs := 0
+		for {
+			if maxErrs == errs {
+				return "", errors.New("max errors exceeded")
+			}
+			qualityPrompt := fmt.Sprintf(`%s
+
+In the above code, based on how well it seems to implement the desired functionality of a service that %s, output JSON with this format:
+
+{"quality": "good", "reason": "would definitely pass a code review", "suggestions": "none"}
+{"quality": "bad", "reason": "unimplemented method", "suggestions": "actually implement the functionality"}
+
+The quality check should return "bad" if there are TODOs, stubs, methods,
+examples, etc. that just return nil or true without doing anything, etc. For
+instance, "we'll do this later" is a strong indication that the code quality is
+"bad".
+`+"```json\n", gptOut, description)
+			qualityCheckOut, err := gpt(ctx, c, qualityPrompt)
+			if err != nil {
+				logrus.WithField("error", err).Error("failed to get gpt output")
+				return "", err
+			}
+			qualityCheckOut = strings.TrimSpace(qualityCheckOut)
+
+			var qualityCheck QualityCheck
+			if err := json.Unmarshal([]byte(qualityCheckOut), &qualityCheck); err != nil {
+				logrus.WithField("error", err).Error("failed to unmarshal quality check")
+				errs++
+				continue
+			}
+
+			if qualityCheck.Quality != "good" {
+				prompt += "```" + fmt.Sprintf(`
+You didn't pass the quality check. Here's the output from the quality check:
+%s`, qualityCheckOut)
+				prompt += "\n\nWrite a version that fixes that error.\n"
+				return "", qualityCheck.Error()
+			}
+
+			break
+		}
+	}
 	gptOut = strings.TrimPrefix(gptOut, "```"+codeType)
 	gptOut = strings.TrimSuffix(gptOut, "```")
 	gptOut = strings.TrimSpace(gptOut)
+	if len(gptOut) == 0 {
+		return "", errors.New("no code to run")
+	}
 
 	if err := ioutil.WriteFile(file, []byte(gptOut), 0644); err != nil {
 		return "", err
@@ -1185,8 +1187,8 @@ func getNonStdImports(filepath string) []string {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, filepath, nil, parser.ImportsOnly)
 	if err != nil {
-		// TODO: handle error
-		logrus.Fatal(err)
+		logrus.Error(err)
+		return nil
 	}
 
 	nonStdImports := []string{}
