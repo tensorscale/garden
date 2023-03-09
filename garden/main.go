@@ -776,7 +776,7 @@ func gptThread(seedling Seedling) {
 										}
 				*/
 				prompt = fmt.Sprintf(`%s
-Now write a server for the service method(s).
+Now write a complete server for the service method(s).
 
 Some of the generated protobuf code looks like this:
 
@@ -785,8 +785,6 @@ Some of the generated protobuf code looks like this:
 And the gRPC:
 
 %s
-
-Here are some instructions:
 
 1. Use external libraries, packages, and binaries if needed.
 2. Assume you are running in a Docker container (Linux). This will 
@@ -797,9 +795,7 @@ Here are some instructions:
    port 8001, take in JSON equivalent to the gRPC call, and call the equivalent
    gRPC server method.
 
-Think step by step. If you want to provide commentary, do it in comments.
-
-Actually implement everything as if it were production ready.
+Think step by step. If you want to provide commentary, do it in comments only.
 
 Make sure to check your imports. Double check those imports.
 `, prompt, strings.Join(protoBufDefs, "\n"), strings.Join(grpcDefs, "\n"), runtime.GOARCH)
@@ -848,7 +844,7 @@ Make sure to check your imports. Double check those imports.
 		case SeedlingStepDockerfile:
 			if !errMode {
 				prompt = fmt.Sprintf(`%s
-Now write a Dockerfile (multi-stage build) to build and run your server.
+Write a multi-stage Dockerfile build
 
 Here is an example:
 
@@ -884,11 +880,9 @@ CMD ["./svcbin"]
 
 Make sure to install any external libraries, packages, and binaries you need.
 
-Make sure to include this line:
+Always include this line:
 
 RUN go get ./...
-
-Think step by step -- what's the best way to build the file?
 
 Write the code. Write only the code.
 `, prompt)
@@ -929,10 +923,9 @@ Write the code. Write only the code.
 				}
 
 				prompt = fmt.Sprintf(`%s
-Now write me a shell script with a example client call with curl to the HTTP
-service, which is running on localhost:%s.
+Write a shell script that can curl the following HTTP service. It is listening on localhost:%s.
 
-Remember, the server code is:
+Here is the HTTP service:
 
 %s
 `, prompt, seedlingPort, serverContents)
