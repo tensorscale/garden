@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/doc"
@@ -114,6 +115,13 @@ type QualityCheck struct {
 	Quality     string `json:"quality"`
 	Reason      string `json:"reason"`
 	Suggestions string `json:"suggestions"`
+}
+
+func (qc QualityCheck) Error() error {
+	if qc.Quality == "good" {
+		return nil
+	}
+	return errors.New(qc.Reason)
 }
 
 func init() {
@@ -659,39 +667,31 @@ func gptThread(seedling Seedling) {
 
 			cid := strings.TrimSpace(string(out))
 
-			cmd = exec.Command("docker", "inspect", cid)
-			out, err = cmd.CombinedOutput()
-			if err != nil {
-				logrus.WithField("error", err).Error("failed to run docker container")
-				return
+			// Define the format for the output of `docker inspect`
+			format := "{{(index (index .NetworkSettings.Ports \"8001/tcp\") 0).HostPort}}"
+
+			// Construct the `docker inspect` command
+			inspectCmd := exec.Command("docker", "inspect", "-f", format, cid)
+
+			// Run the command and capture its output
+			var inspectOut bytes.Buffer
+			inspectCmd.Stdout = &inspectOut
+			if err := inspectCmd.Run(); err != nil {
+				logrus.Fatal(err)
 			}
 
-			var inspect []struct {
-				NetworkSettings struct {
-					Ports map[string][]struct {
-						HostPort string `json:"HostPort"`
-					} `json:"Ports"`
-				} `json:"NetworkSettings"`
+			// Extract the host port number from the command output
+			hostPort := string(out)
+			if hostPort == "" {
+				// Port is not mapped
+				fmt.Println("Port 8001 is not mapped to the host")
+			} else {
+				fmt.Printf("Port 8001 is mapped to host port %s\n", hostPort)
 			}
-			if err := json.Unmarshal(out, &inspect); err != nil {
-				logrus.WithField("error", err).Error("failed to run docker container")
-				return
-			}
-
-			// get port for 8001 from inspect output
-			for _, port := range inspect[0].NetworkSettings.Ports["8001/tcp"] {
-				logrus.Error(port)
-				if port.HostPort != "" {
-					seedlingPort = port.HostPort
-					break
-				}
-			}
-
-			spew.Dump(inspect)
 
 			logrus.WithField("n_errs", errs).
 				WithField("container_id", cid).
-				WithField("container_ports", inspect[0].NetworkSettings.Ports["8001/tcp"][0]).
+				WithField("container_http_port", hostPort).
 				Info("Seedling build complete. Launching Docker container for seedling")
 			break
 		}
