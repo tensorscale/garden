@@ -681,17 +681,17 @@ func gptThread(seedling Seedling) {
 			}
 
 			// Extract the host port number from the command output
-			hostPort := string(out)
-			if hostPort == "" {
+			seedlingPort = string(out)
+			if seedlingPort == "" {
 				// Port is not mapped
 				fmt.Println("Port 8001 is not mapped to the host")
 			} else {
-				fmt.Printf("Port 8001 is mapped to host port %s\n", hostPort)
+				fmt.Printf("Port 8001 is mapped to host port %s\n", seedlingPort)
 			}
 
 			logrus.WithField("n_errs", errs).
 				WithField("container_id", cid).
-				WithField("container_http_port", hostPort).
+				WithField("container_http_port", seedlingPort).
 				Info("Seedling build complete. Launching Docker container for seedling")
 			break
 		}
