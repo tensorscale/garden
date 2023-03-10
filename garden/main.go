@@ -14,6 +14,7 @@ import (
 	"go/printer"
 	"go/token"
 	"io/ioutil"
+	"math/rand"
 	mathrand "math/rand"
 	"net/http"
 	"os"
@@ -234,6 +235,7 @@ func serveCmd(cliCtx *cli.Context) error {
 }
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
 	mathrand.Seed(time.Now().UnixNano())
 	logrus.SetReportCaller(true)
 	logrus.SetFormatter(&logrus.TextFormatter{
@@ -635,7 +637,9 @@ func ListSeedlings(w http.ResponseWriter, r *http.Request) {
 func gptThread(seedling Seedling) {
 	ctx := context.Background()
 	c := gogpt.NewClient(os.Getenv("OPENAI_API_KEY"))
-	maxErrs := 15
+	maxErrs := 3
+	maxRuns := 5
+	runs := 0
 	step := 0
 	steps := []string{
 		SeedlingStepProtobufs,
@@ -652,6 +656,11 @@ func gptThread(seedling Seedling) {
 	dumpedModDocs := false
 
 	for {
+		runs++
+		if runs > maxRuns {
+			logrus.WithField("seedling", seedling.Name).Error("max runs reached")
+			return
+		}
 		if steps[step] == SeedlingStepComplete {
 			cmd := exec.Command("docker", "run",
 				"--init",
@@ -784,10 +793,16 @@ Here are some instructions:
 5. Log information about each request to the HTTP server with logrus. Use logrus.WithField
    to include information about the request, including relevant args, method name, duration etc.
 6. Make sure to go the gRPC Serve() in a goroutine, and then block on the HTTP server.
+7. In addition to exposing the gRPC service, also expose an HTTP health check endpoint
+8. Add an additional HTTP endpoint that will return the "schema" for the service, i.e.,
+   a JSON representation of the protobuf definitions, with some extra items, such as 
+   metadata kv pairs defining things like a file_type for an arg of bytes.
 
 Think step by step. If you want to provide commentary, do it in comments.
 
 Actually implement everything as if it were production ready.
+
+Make sure to terminate all string literals.
 
 Some of the generated protobuf code looks like this:
 
@@ -924,6 +939,12 @@ service. which is running on localhost:$(docker inspect -f '{{ (index .NetworkSe
 If it needs an input file or multiple input files, pass those in as args. If
 this is true and the args aren't present, error out.
 
+In the script, set:
+
+`+"```"+`
+set -euxo pipefail
+`+"```"+`
+
 Remember, the server code is:
 `+"```go\n%s```", prompt, seedling.Name, serverContents)
 			} else {
@@ -972,8 +993,10 @@ Remember, the server code is:
 			logrus.WithField("error", err).Error("failed to run seedling")
 			errs++
 			if errs > maxErrs {
-				logrus.Error("Max errors exceeded")
-				return
+				logrus.Error("hit max errs, resetting")
+				errs = 0
+				step = 0
+				continue
 			}
 
 			lines := strings.Split(output, "\n")
@@ -982,7 +1005,7 @@ Remember, the server code is:
 			}
 			output = strings.Join(lines, "\n")
 			if output == "" {
-				output = err.Error()
+				output = err.Error() + "\n"
 			}
 
 			prompt += gptOutput + "```\n\nThat code didn't work.\n\nIt got an error:\n\n```\n" + output + "```"
@@ -1007,17 +1030,20 @@ Remember, the server code is:
 }
 
 func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
+	temp := rand.Float32()*(1.5-0.2) + 0.2
+
 	logrus.Warn("====== PROMPTING GPT ======")
 	fmt.Println(prompt)
-	logrus.Warn("====== PROMPTING GPT END ======")
+	logrus.WithField("prompt_len", len(prompt)).WithField("temperature",
+		temp).Warn("====== PROMPTING GPT END ======")
 
 	req := gogpt.CompletionRequest{
 		Model: "text-alpha-002-longcontext-0818",
 		// Model:     "text-alpha-002-latest",
-		MaxTokens: 2048,
-		Prompt:    prompt,
-		Stop:      []string{"```"},
-		// Temperature: 1.0,
+		MaxTokens:   2048,
+		Prompt:      prompt,
+		Stop:        []string{"```"},
+		Temperature: temp,
 	}
 	resp, err := c.CreateCompletion(ctx, req)
 	if err != nil {
@@ -1057,9 +1083,9 @@ In the above code, based on how well it seems to implement the desired functiona
 `+"```"+`
 
 The quality check should return "bad" if there are TODOs, stubs, methods,
-examples, etc. that just return nil or true without doing anything, etc. For
-instance, "we'll do this later" is a strong indication that the code quality is
-"bad".
+examples, simulations etc. that just return nil or true without doing anything,
+etc. For instance, "we'll do this later" is a strong indication that the code
+quality is "bad".
 `+"```json\n", gptOut, description)
 			qualityCheckOut, err := gpt(ctx, c, qualityPrompt)
 			if err != nil {
