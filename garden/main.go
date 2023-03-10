@@ -669,25 +669,15 @@ func gptThread(seedling Seedling) {
 
 			cid := strings.TrimSpace(string(out))
 
-			// Construct the `docker inspect` command
 			inspectCmd := exec.Command("docker", "inspect", "-f", "{{ json .NetworkSettings.Ports }}", cid)
 
-			// Run the command and capture its output
 			var inspectOut bytes.Buffer
 			inspectCmd.Stdout = &inspectOut
 			if err := inspectCmd.Run(); err != nil {
 				logrus.Fatal(err)
 			}
 
-			// Extract the host port number from the command output
 			seedlingPort = string(out)
-			if seedlingPort == "" {
-				// Port is not mapped
-				fmt.Println("Port 8001 is not mapped to the host")
-			} else {
-				fmt.Printf("Port 8001 is mapped to host port %s\n", seedlingPort)
-			}
-
 			logrus.WithField("n_errs", errs).
 				WithField("container_id", cid).
 				WithField("container_ports", seedlingPort).
@@ -777,6 +767,8 @@ func gptThread(seedling Seedling) {
 				prompt = fmt.Sprintf(`%s
 Now write a server implementation for the service method(s).
 
+It should be package main.
+
 Here are some instructions:
 
 1. Make sure it's an actual production implementation of the service. Implement
@@ -796,8 +788,6 @@ Here are some instructions:
 Think step by step. If you want to provide commentary, do it in comments.
 
 Actually implement everything as if it were production ready.
-
-Make sure to check your imports. Double check those imports.
 
 Some of the generated protobuf code looks like this:
 
@@ -873,7 +863,10 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
   <package_1> \
   <package_2>
+RUN groupadd -r appuser && useradd -r -g appuser appuser
 COPY --from=builder /tmp/svc /bin/svc
+RUN chown appuser:appuser /bin/svc
+USER appuser
 EXPOSE 8000
 EXPOSE 8001
 CMD ["/bin/svc"]
@@ -928,8 +921,11 @@ Write the code. Write only the code.
 Now write me a shell script with a example client call with curl to the HTTP
 service. which is running on localhost:$(docker inspect -f '{{ (index .NetworkSettings.Ports "8001/tcp" 0).HostPort }}' %s).
 
+If it needs an input file or multiple input files, pass those in as args. If
+this is true and the args aren't present, error out.
+
 Remember, the server code is:
-`+"```go%s```", prompt, seedling.Name, serverContents)
+`+"```go\n%s```", prompt, seedling.Name, serverContents)
 			} else {
 				errMode = false
 			}
@@ -1018,10 +1014,10 @@ func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
 	req := gogpt.CompletionRequest{
 		Model: "text-alpha-002-longcontext-0818",
 		// Model:     "text-alpha-002-latest",
-		MaxTokens:   2048,
-		Prompt:      prompt,
-		Stop:        []string{"```"},
-		Temperature: 0.3,
+		MaxTokens: 2048,
+		Prompt:    prompt,
+		Stop:      []string{"```"},
+		// Temperature: 1.0,
 	}
 	resp, err := c.CreateCompletion(ctx, req)
 	if err != nil {
