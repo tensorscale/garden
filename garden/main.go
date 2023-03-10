@@ -121,7 +121,7 @@ func (qc QualityCheck) Error() error {
 	if qc.Quality == "good" {
 		return nil
 	}
-	return errors.New(qc.Reason)
+	return errors.New("Quality check failed for this reason: " + qc.Reason + ". To improve the quality, we suggest you: " + qc.Suggestions)
 }
 
 func init() {
@@ -649,6 +649,8 @@ func gptThread(seedling Seedling) {
 	prompt := ""
 	errMode := false
 	seedlingPort := ""
+	dumpedModDocs := false
+
 	for {
 		if steps[step] == SeedlingStepComplete {
 			cmd := exec.Command("docker", "run",
@@ -667,10 +669,8 @@ func gptThread(seedling Seedling) {
 
 			cid := strings.TrimSpace(string(out))
 
-			format := `{{ (index .NetworkSettings.Ports "8001/tcp" 0).HostPort }}`
-
 			// Construct the `docker inspect` command
-			inspectCmd := exec.Command("docker", "inspect", "-f", format, cid)
+			inspectCmd := exec.Command("docker", "inspect", "-f", "{{ json .NetworkSettings.Ports }}", cid)
 
 			// Run the command and capture its output
 			var inspectOut bytes.Buffer
@@ -690,7 +690,7 @@ func gptThread(seedling Seedling) {
 
 			logrus.WithField("n_errs", errs).
 				WithField("container_id", cid).
-				WithField("container_http_port", seedlingPort).
+				WithField("container_ports", seedlingPort).
 				Info("Seedling build complete. Launching Docker container for seedling")
 			break
 		}
@@ -699,7 +699,6 @@ func gptThread(seedling Seedling) {
 		codeType := ""
 		cmdCmd := ""
 		cmdArgs := []string{}
-		dumpedModDocs := false
 		logrus.Warn("step: ", steps[step])
 
 		switch steps[step] {
@@ -749,6 +748,7 @@ func gptThread(seedling Seedling) {
 			if err != nil {
 				logrus.Fatal(err)
 			}
+
 			serverFile := filepath.Join(
 				"repos",
 				"default",
@@ -775,7 +775,29 @@ func gptThread(seedling Seedling) {
 										}
 				*/
 				prompt = fmt.Sprintf(`%s
-Now write a complete server for the service method(s).
+Now write a server implementation for the service method(s).
+
+Here are some instructions:
+
+1. Make sure it's an actual production implementation of the service. Implement
+   everything. Don't leave anything out.
+2. Use external libraries, packages, and binaries if needed.
+3. Assume you are running in a Docker container (Linux). This will 
+   run on Debian, so make sure it's compatible with Debian (Bookworm).
+   This should be oriented at processor architecture %s.
+4. Make the gRPC service listen on port 8000, with insecure connection
+   settings. In the same file, also include an HTTP server that will listen on
+   port 8001, take in JSON equivalent to the gRPC call, and call the equivalent
+   gRPC server method.
+5. Log information about each request to the HTTP server with logrus. Use logrus.WithField
+   to include information about the request, including relevant args, method name, duration etc.
+6. Make sure to go the gRPC Serve() in a goroutine, and then block on the HTTP server.
+
+Think step by step. If you want to provide commentary, do it in comments.
+
+Actually implement everything as if it were production ready.
+
+Make sure to check your imports. Double check those imports.
 
 Some of the generated protobuf code looks like this:
 
@@ -784,20 +806,7 @@ Some of the generated protobuf code looks like this:
 And the gRPC:
 
 %s
-
-1. Use external libraries, packages, and binaries if needed.
-2. Assume you are running in a Docker container (Linux). This will 
-   run on Debian, so make sure it's compatible with Debian (Bookworm).
-   This should be oriented at processor architecture %s.
-3. Make the gRPC service listen on port 8000, with insecure connection
-   settings. In the same file, also include an HTTP server that will listen on
-   port 8001, take in JSON equivalent to the gRPC call, and call the equivalent
-   gRPC server method.
-
-Think step by step. If you want to provide commentary, do it in comments only.
-
-Make sure to check your imports. Double check those imports.
-`, prompt, strings.Join(protoBufDefs, "\n"), strings.Join(grpcDefs, "\n"), runtime.GOARCH)
+`, prompt, runtime.GOARCH, strings.Join(protoBufDefs, "\n"), strings.Join(grpcDefs, "\n"))
 			} else {
 				errMode = false
 				if !dumpedModDocs {
@@ -843,45 +852,39 @@ Make sure to check your imports. Double check those imports.
 		case SeedlingStepDockerfile:
 			if !errMode {
 				prompt = fmt.Sprintf(`%s
-Write a multi-stage Dockerfile build
+Now write a Dockerfile (multi-stage build) to build and run your server.
 
 Here is an example:
 
 FROM debian:bookworm-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-  golang \
+  ca-certificates \
   git \
-  protobuf-compiler \
-  ca-certificates
+  golang-go \
+  <other_pkgs>
+COPY . /app
 WORKDIR /app
-COPY go.mod .
-RUN go mod tidy && go mod download
-COPY protobufs/<service>.proto protobufs/
-RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest && \
-  go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-ENV PATH="/root/go/bin:${PATH}"
-RUN protoc --go_out=. --go_opt=paths=source_relative \
-  --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-  protobufs/<service>.proto
-COPY server/*.go .
 RUN go get ./...
-RUN go build -o /app/svcbin .
+RUN go build -o /tmp/svc ./server
 
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   <package_1> \
   <package_2>
-COPY --from=builder /app/svcbin /app/svcbin
-WORKDIR /app
-CMD ["./svcbin"]
+COPY --from=builder /tmp/svc /bin/svc
+EXPOSE 8000
+EXPOSE 8001
+CMD ["/bin/svc"]
 
 Make sure to install any external libraries, packages, and binaries you need.
 
-Always include this line:
+Make sure to include this line:
 
 RUN go get ./...
+
+Think step by step -- what's the best way to build the file?
 
 Write the code. Write only the code.
 `, prompt)
@@ -922,12 +925,11 @@ Write the code. Write only the code.
 				}
 
 				prompt = fmt.Sprintf(`%s
-Write a shell script that can curl the following HTTP service. It is listening on localhost:%s.
+Now write me a shell script with a example client call with curl to the HTTP
+service. which is running on localhost:$(docker inspect -f '{{ (index .NetworkSettings.Ports "8001/tcp" 0).HostPort }}' %s).
 
-Here is the HTTP service:
-
-%s
-`, prompt, seedlingPort, serverContents)
+Remember, the server code is:
+`+"```go%s```", prompt, seedling.Name, serverContents)
 			} else {
 				errMode = false
 			}
@@ -971,6 +973,7 @@ Here is the HTTP service:
 			seedling.Description,
 			c,
 		); err != nil {
+			logrus.WithField("error", err).Error("failed to run seedling")
 			errs++
 			if errs > maxErrs {
 				logrus.Error("Max errors exceeded")
@@ -982,8 +985,11 @@ Here is the HTTP service:
 				lines = lines[len(lines)-25:]
 			}
 			output = strings.Join(lines, "\n")
+			if output == "" {
+				output = err.Error()
+			}
 
-			prompt += "```\nThis code didn't work:\n```" + codeType + "\n" + gptOutput + "```\n\nIt got an error: \n" + output
+			prompt += gptOutput + "```\n\nThat code didn't work.\n\nIt got an error:\n\n```\n" + output + "```"
 			prompt += "\n\nWrite a version that fixes that error.\n"
 			errMode = true
 		} else {
@@ -1001,19 +1007,6 @@ Here is the HTTP service:
 			prompt += "```\n\nGreat. That worked. Let's move on to the next step.\n\n"
 			step += 1
 		}
-
-		/*
-			if err := classifySeedlingOutput(); err != nil {
-				thread += "\n\nI got this output: " + exec["output"]
-				isFinishedPrompt := "I ran this code:\n\n" + gptOutput + "\n\nAnd got this output:\n\n" + exec["output"] + "\n\nMy expected output was this:\n\n" + expectedOutput + "Return the word yes or no to indicate if I got the correct output.\n\nAnswer:"
-				isFinished := gpt(c, ctx, isFinishedPrompt)
-				if isFinished == "yes" {
-					return
-				} else {
-					thread += isFinishedPrompt + "\n\nI got the wrong output. Provide a fix to get the expected output. Use Markdown.\n\n" + threadStartSeq
-				}
-			}
-		*/
 	}
 }
 
@@ -1025,9 +1018,10 @@ func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
 	req := gogpt.CompletionRequest{
 		Model: "text-alpha-002-longcontext-0818",
 		// Model:     "text-alpha-002-latest",
-		MaxTokens: 2048,
-		Prompt:    prompt,
-		Stop:      []string{"```"},
+		MaxTokens:   2048,
+		Prompt:      prompt,
+		Stop:        []string{"```"},
+		Temperature: 0.3,
 	}
 	resp, err := c.CreateCompletion(ctx, req)
 	if err != nil {
@@ -1052,18 +1046,19 @@ func runSeedling(
 	c *gogpt.Client,
 ) (string, error) {
 	if step == SeedlingStepServer {
-		maxErrs := 10
+		maxErrs := 5
 		errs := 0
 		for {
 			if maxErrs == errs {
 				return "", errors.New("max errors exceeded")
 			}
-			qualityPrompt := fmt.Sprintf(`%s
-
+			qualityPrompt := fmt.Sprintf("```\n%s\b```"+`
 In the above code, based on how well it seems to implement the desired functionality of a service that %s, output JSON with this format:
 
+`+"```"+`
 {"quality": "good", "reason": "would definitely pass a code review", "suggestions": "none"}
 {"quality": "bad", "reason": "unimplemented method", "suggestions": "actually implement the functionality"}
+`+"```"+`
 
 The quality check should return "bad" if there are TODOs, stubs, methods,
 examples, etc. that just return nil or true without doing anything, etc. For
