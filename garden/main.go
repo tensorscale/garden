@@ -8,8 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
-	"go/doc"
-	"go/format"
 	"go/parser"
 	"go/printer"
 	"go/token"
@@ -57,6 +55,7 @@ var (
 	SeedlingStepClient             = "SeedlingStepClient"
 	SeedlingStepExampleClientCall  = "SeedlingStepExampleClientCall"
 	SeedlingStepComplete           = "SeedlingStepComplete"
+	openAIAPITicker                = time.NewTicker(2 * time.Second)
 )
 
 type DBRow struct {
@@ -126,7 +125,6 @@ func (qc QualityCheck) Error() error {
 }
 
 func init() {
-	fmt.Println(GetExamples("github.com/sirupsen/logrus"))
 	var err error
 	db, err = otelsqlx.Open("sqlite3",
 		"garden.sqlite3?cache=shared&_synchronous=normal&_journal_mode=WAL",
@@ -604,6 +602,14 @@ func DeleteSeedling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// docker rm -f seedling.Name
+	cmd = exec.Command("docker", "rm", "-f", seedling.Name)
+	if err := cmd.Run(); err != nil {
+		logrus.WithField("error", err).Error("failed to delete seedling")
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
 	// Return a success message
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]string{"message": "seedling deleted"}); err != nil {
@@ -639,8 +645,8 @@ func gptThread(seedling Seedling) {
 	c := gogpt.NewClient(os.Getenv("OPENAI_API_KEY"))
 	maxErrs := 3
 	maxRuns := 5
-	runs := 0
 	step := 0
+	startStep := 0
 	steps := []string{
 		SeedlingStepProtobufs,
 		SeedlingStepServer,
@@ -648,6 +654,13 @@ func gptThread(seedling Seedling) {
 		SeedlingStepExampleClientCall,
 		SeedlingStepComplete,
 	}
+	for i := range steps {
+		if steps[i] == seedling.Step {
+			startStep = i
+			break
+		}
+	}
+	step = startStep
 
 	errs := 0
 	prompt := ""
@@ -655,125 +668,126 @@ func gptThread(seedling Seedling) {
 	seedlingPort := ""
 	dumpedModDocs := false
 
-	for {
-		runs++
-		if runs > maxRuns {
-			logrus.WithField("seedling", seedling.Name).Error("max runs reached")
+	for runs := 0; ; runs++ {
+		if runs+1 == maxRuns {
+			logrus.Error("max runs reached")
 			return
 		}
-		if steps[step] == SeedlingStepComplete {
-			cmd := exec.Command("docker", "run",
-				"--init",
-				"--name", seedling.Name,
-				"-d",
-				"-p", "8001",
-				"-p", "8000",
-				seedling.Name,
-			)
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				logrus.WithField("error", err).Error("failed to run docker container")
-				return
-			}
-
-			cid := strings.TrimSpace(string(out))
-
-			inspectCmd := exec.Command("docker", "inspect", "-f", "{{ json .NetworkSettings.Ports }}", cid)
-
-			var inspectOut bytes.Buffer
-			inspectCmd.Stdout = &inspectOut
-			if err := inspectCmd.Run(); err != nil {
-				logrus.Fatal(err)
-			}
-
-			seedlingPort = string(out)
-			logrus.WithField("n_errs", errs).
-				WithField("container_id", cid).
-				WithField("container_ports", seedlingPort).
-				Info("Seedling build complete. Launching Docker container for seedling")
-			break
-		}
-
-		repoPath := ""
-		codeType := ""
-		cmdCmd := ""
-		cmdArgs := []string{}
-		logrus.Warn("step: ", steps[step])
-
-		switch steps[step] {
-		case SeedlingStepProtobufs:
-			if !errMode {
-				prompt = fmt.Sprintf("%s\n", fmt.Sprintf(
-					protoPrompt,
-					seedling.Description,
+		for {
+			if steps[step] == SeedlingStepComplete {
+				cmd := exec.Command("docker", "run",
+					"--init",
+					"--name", seedling.Name,
+					"-d",
+					"-p", "8001",
+					"-p", "8000",
 					seedling.Name,
+				)
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					logrus.WithField("error", err).Error("failed to run docker container")
+					return
+				}
+
+				cid := strings.TrimSpace(string(out))
+
+				inspectCmd := exec.Command("docker", "inspect", "-f", "{{ json .NetworkSettings.Ports }}", cid)
+
+				var inspectOut bytes.Buffer
+				inspectCmd.Stdout = &inspectOut
+				if err := inspectCmd.Run(); err != nil {
+					logrus.Fatal(err)
+				}
+
+				seedlingPort = string(out)
+				logrus.WithField("n_errs", errs).
+					WithField("container_id", cid).
+					WithField("container_ports", seedlingPort).
+					Info("Seedling build complete. Launching Docker container for seedling")
+				break
+			}
+
+			repoPath := ""
+			codeType := ""
+			cmdCmd := ""
+			cmdArgs := []string{}
+			logrus.Warn("step: ", steps[step])
+
+			switch steps[step] {
+			case SeedlingStepProtobufs:
+				if !errMode {
+					prompt = fmt.Sprintf("%s\n", fmt.Sprintf(
+						protoPrompt,
+						seedling.Description,
+						seedling.Name,
+						seedling.Name,
+						seedling.Description,
+					))
+				} else {
+					errMode = false
+				}
+				prompt += "```protobuf\n"
+				repoPath = filepath.Join("protobufs", seedling.Name+".proto")
+				codeType = "proto"
+				cmdCmd = "protoc"
+				cmdArgs = []string{
+					"-I=.",
+					"--go_out=.",
+					"--go-grpc_out=.",
+					repoPath,
+				}
+
+			case SeedlingStepServer:
+				protoFile := filepath.Join(
+					"repos",
+					"default",
 					seedling.Name,
-					seedling.Description,
-				))
-			} else {
-				errMode = false
-			}
-			prompt += "```protobuf\n"
-			repoPath = filepath.Join("protobufs", seedling.Name+".proto")
-			codeType = "proto"
-			cmdCmd = "protoc"
-			cmdArgs = []string{
-				"-I=.",
-				"--go_out=.",
-				"--go-grpc_out=.",
-				repoPath,
-			}
+					"protobufs",
+					seedling.Name+".pb.go",
+				)
+				protoBufDefs, err := getStructAndInterfaceDefinitionsFromFile(protoFile)
+				if err != nil {
+					logrus.Fatal(err)
+				}
+				grpcFile := filepath.Join(
+					"repos",
+					"default",
+					seedling.Name,
+					"protobufs",
+					seedling.Name+"_grpc.pb.go",
+				)
+				grpcDefs, err := getStructAndInterfaceDefinitionsFromFile(grpcFile)
+				if err != nil {
+					logrus.Fatal(err)
+				}
 
-		case SeedlingStepServer:
-			protoFile := filepath.Join(
-				"repos",
-				"default",
-				seedling.Name,
-				"protobufs",
-				seedling.Name+".pb.go",
-			)
-			protoBufDefs, err := getStructAndInterfaceDefinitionsFromFile(protoFile)
-			if err != nil {
-				logrus.Fatal(err)
-			}
-			grpcFile := filepath.Join(
-				"repos",
-				"default",
-				seedling.Name,
-				"protobufs",
-				seedling.Name+"_grpc.pb.go",
-			)
-			grpcDefs, err := getStructAndInterfaceDefinitionsFromFile(grpcFile)
-			if err != nil {
-				logrus.Fatal(err)
-			}
+				serverFile := filepath.Join(
+					"repos",
+					"default",
+					seedling.Name,
+					"server",
+					"main.go",
+				)
 
-			serverFile := filepath.Join(
-				"repos",
-				"default",
-				seedling.Name,
-				"server",
-				"main.go",
-			)
+				if !errMode {
+					/*
+						// TODO: I like this idea, but GPT hallucinates too many repos that don't exist.
+						// Maybe we can use the description to find some real repos? On Github, sourcegraph etc
+									moduleSuggestions, err := gpt(ctx, c, fmt.Sprintf(`
+							Give me three real Go modules that might be useful for a service with this description: %s.
 
-			if !errMode {
-				/*
-					// TODO: I like this idea, but GPT hallucinates too many repos that don't exist.
-					// Maybe we can use the description to find some real repos? On Github, sourcegraph etc
-								moduleSuggestions, err := gpt(ctx, c, fmt.Sprintf(`
-						Give me three real Go modules that might be useful for a service with this description: %s.
+							Include them in the format:
 
-						Include them in the format:
-
-						- github.com/user/repo - description
-						...
-						`+"```", seedling.Description))
-										if err != nil {
-											logrus.Error(err)
-											return
-										}
-				*/
-				prompt = fmt.Sprintf(`%s
+							- github.com/user/repo - description
+							...
+							`+"```", seedling.Description))
+											if err != nil {
+												logrus.Error(err)
+												return
+											}
+					*/
+					// get from go.pkg.dev
+					prompt = fmt.Sprintf(`%s
 Now write a server implementation for the service method(s).
 
 It should be package main.
@@ -789,20 +803,48 @@ Here are some instructions:
 4. Make the gRPC service listen on port 8000, with insecure connection
    settings. In the same file, also include an HTTP server that will listen on
    port 8001, take in JSON equivalent to the gRPC call, and call the equivalent
-   gRPC server method.
+   gRPC server method. If the HTTP server method receives file(s), use FormFile.
 5. Log information about each request to the HTTP server with logrus. Use logrus.WithField
    to include information about the request, including relevant args, method name, duration etc.
 6. Make sure to go the gRPC Serve() in a goroutine, and then block on the HTTP server.
-7. In addition to exposing the gRPC service, also expose an HTTP health check endpoint
-8. Add an additional HTTP endpoint that will return the "schema" for the service, i.e.,
-   a JSON representation of the protobuf definitions, with some extra items, such as 
-   metadata kv pairs defining things like a file_type for an arg of bytes.
+7. In addition to exposing the gRPC service, also expose an HTTP health check endpoint at /healthz.
+8. Add an additional HTTP endpoint /schema that will return the schema for the
+   service, i.e., a JSON representation of the request/response and their JSON
+   fields, with some extra "labels": [], that describe things like file_type if
+   there is an arg of []byte. Like, "labels": [["file_type", "image/png"]]. This
+   will be used to generate frontend code automatically.
+9. Don't worry about importing protoimpl, github.com/golang/protobuf stuff. You
+   don't need that.
+
+This is an example response from the /schema endpoint:
+
+[
+  {
+    "method": "MethodName",
+    "methodURL": "/method",
+    "name": "CenterCrop",
+    "request": {
+      "numberArg": {
+        default: ${DEFAULT},
+	labels: [],
+      },
+      "fileArg": {
+        default: ${DEFAULT},
+	labels: [["fileType", "image/png"]]
+      },
+    }
+    "response": {
+	"newFile": {
+	  labels: [["fileType", "image/png"]]
+        }
+    },
+  }
+]
 
 Think step by step. If you want to provide commentary, do it in comments.
 
-Actually implement everything as if it were production ready.
-
-Make sure to terminate all string literals.
+Actually implement everything as if it were production ready. Make sure to
+terminate all string literals.
 
 Some of the generated protobuf code looks like this:
 
@@ -811,52 +853,55 @@ Some of the generated protobuf code looks like this:
 And the gRPC:
 
 %s
-`, prompt, runtime.GOARCH, strings.Join(protoBufDefs, "\n"), strings.Join(grpcDefs, "\n"))
-			} else {
-				errMode = false
-				if !dumpedModDocs {
-					dumpedModDocs = true
-					nonStdImports := getNonStdImports(serverFile)
-					allDocs := "\nHere is some documentation that might be useful:\n"
-					goDocErr := false
-					mods := 0
-					for _, imp := range nonStdImports {
-						if strings.Contains(imp, "protobuf") ||
-							strings.Contains(imp, "logrus") ||
-							strings.Contains(imp, "grpc") ||
-							strings.Contains(imp, "spew") {
-							// skip for now, too spammy
-							continue
+
+Now let's write the code. Write only the code.
+`, prompt, runtime.GOARCH, strings.Join(protoBufDefs, "\n"),
+						strings.Join(grpcDefs, "\n"))
+				} else {
+					errMode = false
+					if !dumpedModDocs {
+						// dumpedModDocs = true
+						nonStdImports := getNonStdImports(serverFile)
+						allDocs := "\nHere is some documentation that might be useful:\n"
+						goDocErr := false
+						mods := 0
+						for _, imp := range nonStdImports {
+							if strings.Contains(imp, "protobuf") ||
+								strings.Contains(imp, "logrus") ||
+								strings.Contains(imp, "grpc") ||
+								strings.Contains(imp, "spew") {
+								// skip for now, too spammy
+								continue
+							}
+							cmd := exec.Command("sh", "-c", "go get ./... && go doc -short "+imp)
+							cmd.Dir = filepath.Join("repos", "default", seedling.Name)
+							out, err := cmd.CombinedOutput()
+							if err != nil {
+								logrus.WithField("error", err).Error("failed to run go doc, output below")
+								goDocErr = true
+								spew.Dump(cmd)
+								fmt.Println(string(out))
+							}
+							mods++
+							allDocs += string(out)
 						}
-						cmd := exec.Command("sh", "-c", "go get ./... && go doc -short "+imp)
-						cmd.Dir = filepath.Join("repos", "default", seedling.Name)
-						out, err := cmd.CombinedOutput()
-						if err != nil {
-							logrus.WithField("error", err).Error("failed to run go doc, output below")
-							goDocErr = true
-							spew.Dump(cmd)
-							fmt.Println(string(out))
+						if !goDocErr && mods > 0 {
+							prompt += allDocs
 						}
-						mods++
-						allDocs += string(out)
-					}
-					if !goDocErr && mods > 0 {
-						prompt += allDocs
 					}
 				}
-			}
 
-			prompt += "```go\n"
-			repoPath = filepath.Join("server", "main.go")
-			codeType = "go"
-			cmdCmd = "sh"
-			cmdArgs = []string{
-				"-c",
-				"go get ./... && go build -o /tmp/server ./server",
-			}
-		case SeedlingStepDockerfile:
-			if !errMode {
-				prompt = fmt.Sprintf(`%s
+				prompt += "```go\n"
+				repoPath = filepath.Join("server", "main.go")
+				codeType = "go"
+				cmdCmd = "sh"
+				cmdArgs = []string{
+					"-c",
+					"go get ./... && goimports -w ./server/main.go && go build -o /tmp/server ./server",
+				}
+			case SeedlingStepDockerfile:
+				if !errMode {
+					prompt = fmt.Sprintf(`%s
 Now write a Dockerfile (multi-stage build) to build and run your server.
 
 Here is an example:
@@ -896,43 +941,43 @@ Think step by step -- what's the best way to build the file?
 
 Write the code. Write only the code.
 `, prompt)
-			} else {
-				errMode = false
-			}
-			prompt += "```dockerfile\n"
-			repoPath = filepath.Join("Dockerfile")
-			codeType = "dockerfile"
-			cmdCmd = "docker"
-			if runtime.GOARCH == "arm64" && runtime.GOOS == "darwin" {
-				cmdArgs = []string{
-					"buildx",
-					"build",
-					"--platform",
-					"linux/amd64",
-					"-t",
-					seedling.Name,
-					".",
+				} else {
+					errMode = false
 				}
-			} else {
-				cmdArgs = []string{
-					"build",
-					"-t",
-					seedling.Name,
-					".",
+				prompt += "```dockerfile\n"
+				repoPath = filepath.Join("Dockerfile")
+				codeType = "dockerfile"
+				cmdCmd = "docker"
+				if runtime.GOARCH == "arm64" && runtime.GOOS == "darwin" {
+					cmdArgs = []string{
+						"buildx",
+						"build",
+						"--platform",
+						"linux/amd64",
+						"-t",
+						seedling.Name,
+						".",
+					}
+				} else {
+					cmdArgs = []string{
+						"build",
+						"-t",
+						seedling.Name,
+						".",
+					}
 				}
-			}
-		case SeedlingStepExampleClientCall:
-			if !errMode {
-				// ioutil readfile server/main.go
-				serverContents, err :=
-					ioutil.ReadFile(filepath.Join("repos",
-						"default", seedling.Name, "server", "main.go"))
-				if err != nil {
-					logrus.WithError(err).Error("failed to read server/main.go")
-					return
-				}
+			case SeedlingStepExampleClientCall:
+				if !errMode {
+					// ioutil readfile server/main.go
+					serverContents, err :=
+						ioutil.ReadFile(filepath.Join("repos",
+							"default", seedling.Name, "server", "main.go"))
+					if err != nil {
+						logrus.WithError(err).Error("failed to read server/main.go")
+						return
+					}
 
-				prompt = fmt.Sprintf(`%s
+					prompt = fmt.Sprintf(`%s
 Now write me a shell script with a example client call with curl to the HTTP
 service. which is running on localhost:$(docker inspect -f '{{ (index .NetworkSettings.Ports "8001/tcp" 0).HostPort }}' %s).
 
@@ -947,95 +992,98 @@ set -euxo pipefail
 
 Remember, the server code is:
 `+"```go\n%s```", prompt, seedling.Name, serverContents)
-			} else {
-				errMode = false
-			}
-			prompt += "```bash\n"
-			repoPath = filepath.Join("example-client-call.sh")
-			codeType = "bash"
-			cmdCmd = "true" // don't bother to verify for now
-			cmdArgs = []string{}
-		default:
-			logrus.WithField("step", steps[step]).Error("unknown step")
-			return
-		}
-
-		file := filepath.Join(
-			"repos",
-			"default",
-			seedling.Name,
-			repoPath,
-		)
-		buildCmd := exec.Command(cmdCmd, cmdArgs...)
-		buildCmd.Dir = filepath.Join(
-			"repos",
-			"default",
-			seedling.Name,
-		)
-
-		gptOutput, err := gpt(ctx, c, prompt)
-		if err != nil {
-			logrus.WithField("error", err).Error("failed to get gpt output")
-			return
-		}
-
-		if output, err := runSeedling(
-			ctx,
-			file,
-			codeType,
-			buildCmd,
-			gptOutput,
-			steps[step],
-			prompt,
-			seedling.Description,
-			c,
-		); err != nil {
-			logrus.WithField("error", err).Error("failed to run seedling")
-			errs++
-			if errs > maxErrs {
-				logrus.Error("hit max errs, resetting")
-				errs = 0
-				step = 0
-				continue
-			}
-
-			lines := strings.Split(output, "\n")
-			if len(lines) > 25 {
-				lines = lines[len(lines)-25:]
-			}
-			output = strings.Join(lines, "\n")
-			if output == "" {
-				output = err.Error() + "\n"
-			}
-
-			prompt += gptOutput + "```\n\nThat code didn't work.\n\nIt got an error:\n\n```\n" + output + "```"
-			prompt += "\n\nWrite a version that fixes that error.\n"
-			errMode = true
-		} else {
-
-			if _, err := db.ExecContext(
-				ctx,
-				"UPDATE seedlings SET step = $1 WHERE id = $2",
-				steps[step+1],
-				seedling.ID,
-			); err != nil {
-				logrus.WithField("error", err).Error("failed to update seedling step")
+				} else {
+					errMode = false
+				}
+				prompt += "```bash\n"
+				repoPath = filepath.Join("example-client-call.sh")
+				codeType = "bash"
+				cmdCmd = "true" // don't bother to verify for now
+				cmdArgs = []string{}
+			default:
+				logrus.WithField("step", steps[step]).Error("unknown step")
 				return
 			}
-			prompt += "\n\n" + gptOutput + "\n\n"
-			prompt += "```\n\nGreat. That worked. Let's move on to the next step.\n\n"
-			step += 1
+
+			file := filepath.Join(
+				"repos",
+				"default",
+				seedling.Name,
+				repoPath,
+			)
+			buildCmd := exec.Command(cmdCmd, cmdArgs...)
+			buildCmd.Dir = filepath.Join(
+				"repos",
+				"default",
+				seedling.Name,
+			)
+
+			temperature := 1.0 - (float32(errs) * 0.2)
+			gptOutput, err := gpt(ctx, c, prompt, temperature)
+			if err != nil {
+				logrus.WithField("error", err).Error("failed to get gpt output")
+				return
+			}
+
+			if output, err := runSeedling(
+				ctx,
+				file,
+				codeType,
+				buildCmd,
+				gptOutput,
+				steps[step],
+				prompt,
+				seedling.Description,
+				c,
+			); err != nil {
+				logrus.WithField("error", err).Error("failed to run seedling")
+				errs++
+				if errs > maxErrs {
+					logrus.Error("hit max errs, trying new run")
+					errs = 0
+					step = startStep
+					break
+				}
+
+				lines := strings.Split(output, "\n")
+				if len(lines) > 25 {
+					lines = lines[len(lines)-25:]
+				}
+				output = strings.Join(lines, "\n")
+				if output == "" {
+					output = err.Error() + "\n"
+				}
+
+				prompt += gptOutput + "```\n\nThat code didn't work.\n\nIt got an error:\n\n```\n" + output + "```"
+				prompt += "\n\nWrite a version that fixes that error.\n"
+				errMode = true
+			} else {
+
+				if _, err := db.ExecContext(
+					ctx,
+					"UPDATE seedlings SET step = $1 WHERE id = $2",
+					steps[step+1],
+					seedling.ID,
+				); err != nil {
+					logrus.WithField("error", err).Error("failed to update seedling step")
+					return
+				}
+				prompt += "\n\n" + gptOutput + "\n\n"
+				prompt += "```\n\nGreat. That worked. Let's move on to the next step.\n\n"
+				step += 1
+			}
 		}
 	}
 }
 
-func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
-	temp := rand.Float32()*(1.5-0.2) + 0.2
+func gpt(ctx context.Context, c *gogpt.Client, prompt string, temperature float32) (string, error) {
+	<-openAIAPITicker.C
+	// temp := rand.Float32()*(1.5-0.2) + 0.2
 
 	logrus.Warn("====== PROMPTING GPT ======")
 	fmt.Println(prompt)
 	logrus.WithField("prompt_len", len(prompt)).WithField("temperature",
-		temp).Warn("====== PROMPTING GPT END ======")
+		temperature).Warn("====== PROMPTING GPT END ======")
 
 	req := gogpt.CompletionRequest{
 		Model: "text-alpha-002-longcontext-0818",
@@ -1043,7 +1091,7 @@ func gpt(ctx context.Context, c *gogpt.Client, prompt string) (string, error) {
 		MaxTokens:   2048,
 		Prompt:      prompt,
 		Stop:        []string{"```"},
-		Temperature: temp,
+		Temperature: temperature,
 	}
 	resp, err := c.CreateCompletion(ctx, req)
 	if err != nil {
@@ -1087,7 +1135,7 @@ examples, simulations etc. that just return nil or true without doing anything,
 etc. For instance, "we'll do this later" is a strong indication that the code
 quality is "bad".
 `+"```json\n", gptOut, description)
-			qualityCheckOut, err := gpt(ctx, c, qualityPrompt)
+			qualityCheckOut, err := gpt(ctx, c, qualityPrompt, 1.0)
 			if err != nil {
 				logrus.WithField("error", err).Error("failed to get gpt output")
 				return "", err
@@ -1212,58 +1260,4 @@ func getNonStdImports(filepath string) []string {
 	}
 
 	return nonStdImports
-}
-
-func parseAllFiles(_ os.FileInfo) bool {
-	return true
-}
-
-func GetExamples(moduleName string) (string, error) {
-	// Parse each Go file and extract examples
-	var examples []*doc.Example
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(f os.FileInfo) bool {
-		return strings.HasSuffix(f.Name(), ".go")
-	}, parser.ParseComments)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse files: %v", err)
-	}
-	for _, pkg := range pkgs {
-		pkgDoc := doc.New(pkg, moduleName, 0)
-		examples = append(examples, pkgDoc.Examples...)
-	}
-
-	// Extract source code for each example
-	var codeStrings []string
-	for _, example := range examples {
-		var buf bytes.Buffer
-		if err := format.Node(&buf, fset, example.Code); err != nil {
-			return "", fmt.Errorf("failed to format example code: %v", err)
-		}
-		codeStrings = append(codeStrings, buf.String())
-	}
-
-	// Concatenate all source code strings
-	return strings.Join(codeStrings, "\n"), nil
-}
-
-func findPackageNode(node *ast.File, fset *token.FileSet) (*ast.Package, error) {
-	// Traverse the AST to find the package declaration node
-	var pkgNode *ast.Package
-	ast.Inspect(node, func(n ast.Node) bool {
-		switch n := n.(type) {
-		case *ast.Package:
-			pkgNode = n
-			return false // stop traversing
-		case *ast.File:
-			// We don't want to traverse into other files
-			return false
-		default:
-			return true // continue traversing
-		}
-	})
-	if pkgNode == nil {
-		return nil, fmt.Errorf("no package node found")
-	}
-	return pkgNode, nil
 }
