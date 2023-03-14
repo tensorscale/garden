@@ -1151,10 +1151,10 @@ func gpt(ctx context.Context, c *gogpt.Client, prompt string, temperature float3
 	req := gogpt.CompletionRequest{
 		Model: "text-alpha-002-longcontext-0818",
 		// Model:     "text-alpha-002-latest",
-		MaxTokens:   2048,
-		Prompt:      prompt,
-		Stop:        []string{"```"},
-		Temperature: temperature,
+		MaxTokens: 2048,
+		Prompt:    prompt,
+		Stop:      []string{"```"},
+		// Temperature: temperature,
 	}
 	resp, err := c.CreateCompletion(ctx, req)
 	if err != nil {
