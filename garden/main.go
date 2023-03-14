@@ -929,7 +929,7 @@ Now let's write the code. Write only the code.
 								// skip for now, too spammy
 								continue
 							}
-							cmd := exec.Command("sh", "-c", "go get ./... && go doc -short "+imp)
+							cmd := exec.Command("sh", "-c", "go get ./... && go doc -all "+imp)
 							cmd.Dir = filepath.Join("repos", "default", seedling.Name)
 							out, err := cmd.CombinedOutput()
 							if err != nil {
@@ -953,7 +953,8 @@ Now let's write the code. Write only the code.
 				cmdCmd = "sh"
 				cmdArgs = []string{
 					"-c",
-					"go get ./... && goimports -w ./server/main.go && go build -o /tmp/server ./server",
+					"go get ./... && go build -o /tmp/server ./server",
+					// "go get ./... && goimports -w ./server/main.go && go build -o /tmp/server ./server",
 				}
 			case SeedlingStepDockerfile:
 				if !errMode {
@@ -1139,6 +1140,11 @@ Remember, the server code is:
 func gpt(ctx context.Context, c *gogpt.Client, prompt string, temperature float32) (string, error) {
 	<-openAIAPITicker.C
 	// temp := rand.Float32()*(1.5-0.2) + 0.2
+
+	// prompt only with last 12000 chars
+	if len(prompt) > 12000 {
+		prompt = prompt[len(prompt)-12000:]
+	}
 
 	logrus.Warn("====== PROMPTING GPT ======")
 	fmt.Println(prompt)
