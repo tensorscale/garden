@@ -87,9 +87,6 @@ type (
 
 var (
 	protoPrompt = `
-Wow, here we are, the angry programmers. Hanging out on Github and Stack
-Overflow, and Sourcegraph. I need you to help me solve an issue.
-
 Write me a protobufs file for a gRPC method with this description:
 
 %s
