@@ -55,7 +55,8 @@ var (
 	SeedlingStepClient             = "SeedlingStepClient"
 	SeedlingStepExampleClientCall  = "SeedlingStepExampleClientCall"
 	SeedlingStepComplete           = "SeedlingStepComplete"
-	openAIAPITicker                = time.NewTicker(2 * time.Second)
+	openAIAPITicker                = time.NewTicker(10 * time.Second)
+	promptWindow                   = 3000
 )
 
 type DBRow struct {
@@ -69,6 +70,7 @@ type Seedling struct {
 	Name        string `db:"name" json:"name"`
 	Description string `db:"description" json:"description"`
 	Step        string `db:"step" json:"step"`
+	LastRunData string `db:"last_run_data" json:"lastRunData"`
 }
 
 type (
@@ -85,7 +87,9 @@ type (
 
 var (
 	protoPrompt = `
-Write me a protobufs file for a gRPC method that %s
+Write me a protobufs file for a gRPC method with this description:
+
+%s
 
 Make sure to start it with lines like:
 
@@ -180,6 +184,31 @@ func init() {
 	}
 	for _, seedling := range seedlings {
 		if seedling.Step != SeedlingStepComplete {
+			cmd := exec.Command("docker", "inspect", seedling.Name)
+			if err := cmd.Run(); err == nil {
+				cmd = exec.Command("docker", "logs", seedling.Name)
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					logrus.WithField("output", string(output)).Error(err)
+					continue
+				}
+				seedling.LastRunData = string(output)
+
+				if _, err := db.NamedExec(`
+				UPDATE seedlings
+				SET
+				last_run_data = :last_run_data
+				WHERE id = :id
+				`, seedling); err != nil {
+					logrus.Fatal(err)
+				}
+
+				cmd := exec.Command("docker", "rm", "-f", seedling.Name)
+				if err := cmd.Run(); err != nil {
+					logrus.WithField("error", err).Fatal("Failed to delete docker container")
+				}
+			}
+
 			go gptThread(seedling)
 		}
 	}
@@ -394,6 +423,7 @@ logs
 		return err
 	}
 
+	// todo: not thread safe, need to lock access to repo before git operations
 	cmd = exec.CommandContext(ctx, "git", "commit", "-m", ".")
 	cmd.Dir = filepath.Join(basePath)
 	if err := cmd.Run(); err != nil {
@@ -787,6 +817,13 @@ func gptThread(seedling Seedling) {
 											}
 					*/
 					// get from go.pkg.dev
+					lastRunPrompt := ""
+					if seedling.LastRunData != "" {
+						lastRunPrompt = fmt.Sprintf(`Also, last time we tried this, the logs looked like this:
+` + seedling.LastRunData + `
+If there are errors there, see if you can fix them this time.
+`)
+					}
 					prompt = fmt.Sprintf(`%s
 Now write a server implementation for the service method(s).
 
@@ -802,44 +839,61 @@ Here are some instructions:
    This should be oriented at processor architecture %s.
 4. Make the gRPC service listen on port 8000, with insecure connection
    settings. In the same file, also include an HTTP server that will listen on
-   port 8001, take in JSON equivalent to the gRPC call, and call the equivalent
-   gRPC server method. If the HTTP server method receives file(s), use FormFile.
+   port 8001 at endpoint /, take in JSON equivalent to the gRPC call, and call the
+   equivalent gRPC server method. If the HTTP server method receives file(s), use
+   FormFile.
 5. Log information about each request to the HTTP server with logrus. Use logrus.WithField
    to include information about the request, including relevant args, method name, duration etc.
+   Log each request and response body in its entirety.
 6. Make sure to go the gRPC Serve() in a goroutine, and then block on the HTTP server.
 7. In addition to exposing the gRPC service, also expose an HTTP health check endpoint at /healthz.
-8. Add an additional HTTP endpoint /schema that will return the schema for the
-   service, i.e., a JSON representation of the request/response and their JSON
-   fields, with some extra "labels": [], that describe things like file_type if
-   there is an arg of []byte. Like, "labels": [["file_type", "image/png"]]. This
-   will be used to generate frontend code automatically.
+8. Add an additional HTTP endpoint /schema that will return the react-jsonschema-form JSON for the
+   service, an example is below.
 9. Don't worry about importing protoimpl, github.com/golang/protobuf stuff. You
    don't need that.
 
-This is an example response from the /schema endpoint:
+The /schema endpoint should be a version of the following, but with the correct
+types and descriptions for the service.
 
-[
-  {
-    "method": "MethodName",
-    "methodURL": "/method",
-    "name": "CenterCrop",
-    "request": {
-      "numberArg": {
-        default: ${DEFAULT},
-	labels: [],
-      },
-      "fileArg": {
-        default: ${DEFAULT},
-	labels: [["fileType", "image/png"]]
-      },
-    }
-    "response": {
-	"newFile": {
-	  labels: [["fileType", "image/png"]]
-        }
+{
+  "title": "",
+  "description": "",
+  "type": "object",
+  "required": [
+    "arg1",
+    "arg2"
+  ],
+  "properties": {
+    "arg1": {
+      "type": "string",
+      "title": "Arg 1",
+      "default": "example"
     },
+    "arg2": {
+      "type": "string",
+      "title": "Arg 2"
+    },
+    "files": {
+      "type": "array",
+      "title": "Multiple files example",
+      "items": {
+        "type": "string",
+        "format": "data-url"
+      }
+    },
+    "filesAccept": {
+      "type": "string",
+      "format": "data-url",
+      "title": "Single file example"
+    },
+    "integerRangeExample": {
+      "title": "int range example",
+      "type": "integer",
+      "minimum": -50,
+      "maximum": 50
+    }
   }
-]
+}
 
 Think step by step. If you want to provide commentary, do it in comments.
 
@@ -854,9 +908,11 @@ And the gRPC:
 
 %s
 
+%s
+
 Now let's write the code. Write only the code.
 `, prompt, runtime.GOARCH, strings.Join(protoBufDefs, "\n"),
-						strings.Join(grpcDefs, "\n"))
+						strings.Join(grpcDefs, "\n"), lastRunPrompt)
 				} else {
 					errMode = false
 					if !dumpedModDocs {
@@ -873,7 +929,7 @@ Now let's write the code. Write only the code.
 								// skip for now, too spammy
 								continue
 							}
-							cmd := exec.Command("sh", "-c", "go get ./... && go doc -short "+imp)
+							cmd := exec.Command("sh", "-c", "go get ./... && go doc -all "+imp)
 							cmd.Dir = filepath.Join("repos", "default", seedling.Name)
 							out, err := cmd.CombinedOutput()
 							if err != nil {
@@ -897,7 +953,8 @@ Now let's write the code. Write only the code.
 				cmdCmd = "sh"
 				cmdArgs = []string{
 					"-c",
-					"go get ./... && goimports -w ./server/main.go && go build -o /tmp/server ./server",
+					"go get ./... && go build -o /tmp/server ./server",
+					// "go get ./... && goimports -w ./server/main.go && go build -o /tmp/server ./server",
 				}
 			case SeedlingStepDockerfile:
 				if !errMode {
@@ -921,6 +978,7 @@ RUN go build -o /tmp/svc ./server
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+  ca-certificates \
   <package_1> \
   <package_2>
 RUN groupadd -r appuser && useradd -r -g appuser appuser
@@ -937,7 +995,8 @@ Make sure to include this line:
 
 RUN go get ./...
 
-Think step by step -- what's the best way to build the file?
+Think step by step -- what's the best way to build the file? If you want to include
+commentary, do it in comments.
 
 Write the code. Write only the code.
 `, prompt)
@@ -989,6 +1048,8 @@ In the script, set:
 `+"```"+`
 set -euxo pipefail
 `+"```"+`
+
+Think step by step.
 
 Remember, the server code is:
 `+"```go\n%s```", prompt, seedling.Name, serverContents)
@@ -1080,6 +1141,11 @@ func gpt(ctx context.Context, c *gogpt.Client, prompt string, temperature float3
 	<-openAIAPITicker.C
 	// temp := rand.Float32()*(1.5-0.2) + 0.2
 
+	// prompt only with last 12000 chars
+	if len(prompt) > 12000 {
+		prompt = prompt[len(prompt)-12000:]
+	}
+
 	logrus.Warn("====== PROMPTING GPT ======")
 	fmt.Println(prompt)
 	logrus.WithField("prompt_len", len(prompt)).WithField("temperature",
@@ -1088,10 +1154,10 @@ func gpt(ctx context.Context, c *gogpt.Client, prompt string, temperature float3
 	req := gogpt.CompletionRequest{
 		Model: "text-alpha-002-longcontext-0818",
 		// Model:     "text-alpha-002-latest",
-		MaxTokens:   2048,
-		Prompt:      prompt,
-		Stop:        []string{"```"},
-		Temperature: temperature,
+		MaxTokens: 2048,
+		Prompt:    prompt,
+		Stop:      []string{"```"},
+		// Temperature: temperature,
 	}
 	resp, err := c.CreateCompletion(ctx, req)
 	if err != nil {
