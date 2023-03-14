@@ -55,7 +55,8 @@ var (
 	SeedlingStepClient             = "SeedlingStepClient"
 	SeedlingStepExampleClientCall  = "SeedlingStepExampleClientCall"
 	SeedlingStepComplete           = "SeedlingStepComplete"
-	openAIAPITicker                = time.NewTicker(5 * time.Second)
+	openAIAPITicker                = time.NewTicker(10 * time.Second)
+	promptWindow                   = 3000
 )
 
 type DBRow struct {
