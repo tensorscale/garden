@@ -20,6 +20,7 @@ import { throttle, debounce, filter } from "underscore";
 import OutsideClickHandler from "react-outside-click-handler";
 import { toast } from "react-toastify";
 import moment from "moment";
+import Form from "@rjsf/core";
 
 const toastParams = {
     className:
@@ -157,7 +158,7 @@ const Seedling = ({ seedling, onDelete, onEdit }) => {
                     className="bg-blue-500 hover:bg-blue-700 text-white py-2 px-4 rounded"
                     onClick={() => onEdit(seedling)}
                 >
-                    Edit
+                    Chat
                 </button>
                 <button
                     className="bg-red-500 hover:bg-red-700 text-white py-2 px-4 rounded"
@@ -187,7 +188,7 @@ const SeedlingList = ({ seedlings, onDelete, onEdit }) => {
 };
 
 // A component to render a form for creating or updating a seedling
-const SeedlingForm = ({ seedling, onSubmit, onCancel }) => {
+const SeedlingView = ({ seedling, onSubmit, onCancel }) => {
     const [name, setName] = useState(seedling ? seedling.name : "");
     const [description, setDescription] = useState(
         seedling ? seedling.description : ""
@@ -203,58 +204,205 @@ const SeedlingForm = ({ seedling, onSubmit, onCancel }) => {
     };
 
     return (
-        <form
-            className="bg-white shadow-lg rounded-lg p-4 m-2"
-            onSubmit={handleSubmit}
+        <div>
+            <form
+                className="bg-white shadow-lg rounded-lg p-4 m-2"
+                onSubmit={handleSubmit}
+            >
+                <div className="mb-4">
+                    <label
+                        className="block text-gray-700 text-sm font-bold mb-2"
+                        htmlFor="name"
+                    >
+                        Name
+                    </label>
+                    <input
+                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+                        id="name"
+                        type="text"
+                        placeholder="Enter seedling name"
+                        value={name}
+                        onChange={(e) => setName(e.target.value)}
+                        required
+                    />
+                </div>
+                <div className="mb-4">
+                    <label
+                        className="block text-gray-700 text-sm font-bold mb-2"
+                        htmlFor="description"
+                    >
+                        Description
+                    </label>
+                    <textarea
+                        className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+                        id="description"
+                        type="text"
+                        placeholder="Enter seedling description"
+                        value={description}
+                        onChange={(e) => setDescription(e.target.value)}
+                    />
+                </div>
+                <div className="flex justify-end space-x-2">
+                    <button
+                        className="bg-gray-500 hover:bg-gray-700 text-white py-2 px-4 rounded"
+                        onClick={onCancel}
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        className="bg-green-500 hover:bg-green-700 text-white py-2 px-4 rounded"
+                        type="submit"
+                    >
+                        {seedling ? "Update" : "Create"}
+                    </button>
+                </div>
+            </form>
+            <Chat seedling={seedling} />
+        </div>
+    );
+};
+
+const PaperAirplaneIcon = () => {
+    return (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            fill="none"
+            viewBox="0 0 24 24"
+            strokeWidth={1.5}
+            stroke="currentColor"
+            className="w-6 h-6"
         >
-            <div className="mb-4">
-                <label
-                    className="block text-gray-700 text-sm font-bold mb-2"
-                    htmlFor="name"
-                >
-                    Name
-                </label>
-                <input
-                    className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
-                    id="name"
-                    type="text"
-                    placeholder="Enter seedling name"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    required
-                />
+            <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5"
+            />
+        </svg>
+    );
+};
+
+const ChatDialogue = () => {
+    return (
+        <div className="flex flex-col h-screen p-4">
+            <div className="rounded-lg p-4 shadow-lg">
+                <div className="font-bold text-lg mb-3">
+                    &#128104;&#8205;&#127806; MONTY
+                </div>
+                <p>
+                    Hi, I'm Monty, your AI pair programmer. You can ask me to
+                    exec commands, show me the errors you're getting, suggest
+                    libraries to use, etc., and I will take care of building it
+                    for you.
+                </p>
             </div>
-            <div className="mb-4">
-                <label
-                    className="block text-gray-700 text-sm font-bold mb-2"
-                    htmlFor="description"
-                >
-                    Description
-                </label>
+            <div className="flex mt-4 items-center">
                 <textarea
-                    className="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
-                    id="description"
-                    type="text"
-                    placeholder="Enter seedling description"
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                />
-            </div>
-            <div className="flex justify-end space-x-2">
-                <button
-                    className="bg-gray-500 hover:bg-gray-700 text-white py-2 px-4 rounded"
-                    onClick={onCancel}
-                >
-                    Cancel
-                </button>
-                <button
-                    className="bg-green-500 hover:bg-green-700 text-white py-2 px-4 rounded"
-                    type="submit"
-                >
-                    {seedling ? "Update" : "Create"}
+                    className="flex-grow p-2 rounded-lg border border-gray-300 resize-none"
+                    rows="2"
+                    placeholder="Type your message here..."
+                ></textarea>
+                <button className="ml-2 p-2 rounded-lg bg-blue-500 text-white">
+                    <PaperAirplaneIcon className="h-6 w-6 transform rotate-45" />
                 </button>
             </div>
-        </form>
+        </div>
+    );
+};
+
+const Chat = ({ seedling }) => {
+    const [history, setHistory] = useState("");
+    const [schema, setSchema] = useState({});
+
+    useEffect(() => {
+        const fetchData = async () => {
+            const response = await fetch(
+                "/api/v1/seedlings/history/" + seedling.name
+            );
+            const json = await response.json();
+            // base64 decode the history
+            json.history = atob(json.history);
+            setHistory(json.history);
+        };
+        const fetchSchemaData = async () => {
+            const schemaData = await fetch(
+                "/api/v1/seedlings/invoke/" + seedling.name + "/schema"
+            );
+            const s = await schemaData.json();
+            setSchema(s);
+        };
+        fetchData();
+        fetchSchemaData();
+    }, [seedling.name]);
+
+    const uiSchema = {
+        classNames: "bg-white p-6 rounded-lg shadow-lg",
+        end: {
+            classNames:
+                "form-input w-full py-2 px-3 border border-gray-300 rounded-md focus:outline-none focus:border-blue-500 mb-4",
+            "ui:options": {
+                label: true,
+                labelClassNames: "font-semibold text-gray-600",
+            },
+        },
+        skip: {
+            classNames:
+                "form-input w-full py-2 px-3 border border-gray-300 rounded-md focus:outline-none focus:border-blue-500 mb-4",
+            "ui:options": {
+                label: true,
+                labelClassNames: "font-semibold text-gray-600",
+            },
+        },
+        start: {
+            classNames:
+                "form-input w-full py-2 px-3 border border-gray-300 rounded-md focus:outline-none focus:border-blue-500 mb-4",
+            "ui:options": {
+                label: true,
+                labelClassNames: "font-semibold text-gray-600",
+            },
+        },
+        "ui:order": ["start", "end", "skip"],
+        "ui:submitButton": {
+            classNames:
+                "bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline",
+        },
+    };
+
+    return (
+        <div className="grid grid-cols-3 gap-5">
+            <div>
+                <div className="flex font-bold text-gray-400 p-4 border-b-2 border-gray-300">
+                    Chat
+                </div>
+                <ChatDialogue />
+            </div>
+            <div>
+                <div className="flex font-bold text-gray-400 p-4 border-b-2 border-gray-300">
+                    Test
+                </div>
+                {schema && (
+                    <div>
+                        <Form
+                            schema={schema}
+                            onSubmit={(formData) =>
+                                console.log("submitted", formData)
+                            }
+                            validator={(foo, bar) => []}
+                        />
+                        <pre>
+                            <code>{JSON.stringify(schema, null, 2)}</code>
+                        </pre>
+                    </div>
+                )}
+            </div>
+            <div>
+                <div className="flex font-bold text-gray-400 p-4 border-b-2 border-gray-300">
+                    History
+                </div>
+                <pre>
+                    <code>{history}</code>
+                </pre>
+            </div>
+        </div>
     );
 };
 
@@ -271,7 +419,7 @@ const SeedlingManager = () => {
     const [error, setError] = useState(null);
 
     // The base URL for the CRUD API
-    const baseURL = "http://localhost:3001/api/v1/seedlings";
+    const baseURL = "/api/v1/seedlings";
 
     // A helper function to refresh the seedlings list
     const refreshSeedlings = () => {
@@ -382,7 +530,7 @@ const SeedlingManager = () => {
     }, []);
 
     return (
-        <div className="container mx-auto p-4">
+        <div className="p-4 w-3/4">
             <h1 className="text-3xl font-bold mb-4">Seedling Manager</h1>
             {status === "loading" && <p>Loading...</p>}
             {status === "error" && <p>Error: {error}</p>}
@@ -395,7 +543,7 @@ const SeedlingManager = () => {
                         Create New Seedling
                     </button>
                     {editing ? (
-                        <SeedlingForm
+                        <SeedlingView
                             seedling={editing}
                             onSubmit={handleSave}
                             onCancel={handleCancel}

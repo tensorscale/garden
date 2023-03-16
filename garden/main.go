@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"math/rand"
 	mathrand "math/rand"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,7 +58,7 @@ var (
 	SeedlingStepClient             = "SeedlingStepClient"
 	SeedlingStepExampleClientCall  = "SeedlingStepExampleClientCall"
 	SeedlingStepComplete           = "SeedlingStepComplete"
-	openAIAPITicker                = time.NewTicker(2 * time.Second)
+	openAIAPITicker                = time.NewTicker(10 * time.Second)
 )
 
 type DBRow struct {
@@ -180,7 +183,7 @@ func init() {
 	}
 	for _, seedling := range seedlings {
 		if seedling.Step != SeedlingStepComplete {
-			go gptThread(seedling)
+			// go gptThread(seedling)
 		}
 	}
 }
@@ -209,6 +212,65 @@ func WithLogging(next http.Handler) http.Handler {
 	})
 }
 
+func apiAccessHandler(w http.ResponseWriter, r *http.Request) {
+	logrus.Info("hi")
+	vars := mux.Vars(r)
+	name := vars["name"]
+
+	// do docker inspect -f '{{ (index .NetworkSettings.Ports "8001/tcp" 0).HostPort }}' $name
+	// use it to proxy request to localhost:$port
+	cmd := exec.Command(
+		"docker",
+		"inspect",
+		"-f",
+		"{{ (index .NetworkSettings.Ports \"8001/tcp\" 0).HostPort }}",
+		name,
+	)
+	spew.Dump(cmd)
+	output, err := cmd.CombinedOutput()
+	spew.Dump(output)
+	if err != nil {
+		logrus.WithField("error", err).Error("Failed to run docker inspect")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	port := strings.TrimSpace(string(output))
+
+	proxy := httputil.NewSingleHostReverseProxy(&url.URL{
+		Scheme: "http",
+		Host:   "localhost:" + port,
+	})
+
+	r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api/v1/seedlings/invoke/"+name)
+
+	proxy.ServeHTTP(w, r)
+}
+
+func patchHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	name := vars["name"]
+
+	cmd := exec.Command(
+		"git",
+		"log",
+		"--pretty=format:'%h %s'",
+		"-p",
+		".",
+	)
+	cmd.Dir = "./repos/default/" + name
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logrus.WithField("error", err).Error("Failed to run git log")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	output = []byte(base64.StdEncoding.EncodeToString(output))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf(`{"history":"%s"}`, string(output))))
+}
+
 func writeJSONErr(w http.ResponseWriter, err string, code int) {
 	w.WriteHeader(code)
 	w.Write([]byte(fmt.Sprintf(`{"error":"%s"}`, err)))
@@ -224,6 +286,8 @@ func serveCmd(cliCtx *cli.Context) error {
 	r.Handle("/api/v1/seedlings/{id}", WithLogging(http.HandlerFunc(GetSeedling))).Methods("GET")
 	r.Handle("/api/v1/seedlings/{id}", WithLogging(http.HandlerFunc(DeleteSeedling))).Methods("DELETE")
 	r.Handle("/api/v1/seedlings/{id}", WithLogging(http.HandlerFunc(UpdateSeedling))).Methods("PUT")
+	r.Handle("/api/v1/seedlings/history/{name}", WithLogging(http.HandlerFunc(patchHandler))).Methods("GET")
+	r.Handle("/api/v1/seedlings/invoke/{name}/{rest:.*}", WithLogging(http.HandlerFunc(apiAccessHandler)))
 
 	log.WithField("service", "garden-api").Info("Listening on :7777")
 	if err := http.ListenAndServe(":7777", otelhttp.NewHandler(r, "garden-api")); err != nil {
@@ -816,30 +880,75 @@ Here are some instructions:
 9. Don't worry about importing protoimpl, github.com/golang/protobuf stuff. You
    don't need that.
 
-This is an example response from the /schema endpoint:
+Here are example responses from the /schema endpoint:
 
-[
-  {
-    "method": "MethodName",
-    "methodURL": "/method",
-    "name": "CenterCrop",
-    "request": {
-      "numberArg": {
-        default: ${DEFAULT},
-	labels: [],
-      },
-      "fileArg": {
-        default: ${DEFAULT},
-	labels: [["fileType", "image/png"]]
-      },
-    }
-    "response": {
-	"newFile": {
-	  labels: [["fileType", "image/png"]]
-        }
+1.
+
+{
+  "title": "A registration form",
+  "description": "A simple form example.",
+  "type": "object",
+  "required": [
+    "firstName",
+    "lastName"
+  ],
+  "properties": {
+    "firstName": {
+      "type": "string",
+      "title": "First name",
+      "default": "Chuck"
     },
+    "lastName": {
+      "type": "string",
+      "title": "Last name"
+    },
+    "age": {
+      "type": "integer",
+      "title": "Age"
+    },
+    "bio": {
+      "type": "string",
+      "title": "Bio"
+    },
+    "password": {
+      "type": "string",
+      "title": "Password",
+      "minLength": 3
+    },
+    "telephone": {
+      "type": "string",
+      "title": "Telephone",
+      "minLength": 10
+    }
   }
-]
+}
+
+2.
+
+{
+  "title": "Files",
+  "type": "object",
+  "properties": {
+    "file": {
+      "type": "string",
+      "format": "data-url",
+      "title": "Single file"
+    },
+    "files": {
+      "type": "array",
+      "title": "Multiple files",
+      "items": {
+        "type": "string",
+        "format": "data-url"
+      }
+    },
+    "filesAccept": {
+      "type": "string",
+      "format": "data-url",
+      "title": "Single File with Accept attribute"
+    }
+  }
+}
 
 Think step by step. If you want to provide commentary, do it in comments.
 
@@ -961,6 +1070,7 @@ Write the code. Write only the code.
 				} else {
 					cmdArgs = []string{
 						"build",
+						"--no-cache",
 						"-t",
 						seedling.Name,
 						".",
