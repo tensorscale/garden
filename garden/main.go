@@ -313,8 +313,6 @@ func main() {
 		},
 	})
 
-	os.Setenv("HONEYCOMB_API_KEY", "zi944sIGUTu1wozNDajQlA")
-
 	log = logrus.WithField("service_name", "garden-api")
 
 	os.Setenv("OTEL_SERVICE_NAME", "garden-api-prod")
